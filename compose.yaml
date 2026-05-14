@@ -1,0 +1,13 @@
+services:
+  scraper:
+    build:
+      context: .
+      dockerfile: Containerfile
+    userns_mode: keep-id
+    volumes:
+      # Mount the local downloads directory
+      - ./downloads:/app/downloads:Z
+      # Mount the local processed directory
+      - ./processed:/app/processed:Z
+      # Mount a local data directory for the SQLite database
+      - ./data:/app/data:Z
