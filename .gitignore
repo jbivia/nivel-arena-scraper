@@ -8,7 +8,6 @@ env/
 build/
 develop-eggs/
 dist/
-downloads/
 eggs/
 lib/
 lib64/

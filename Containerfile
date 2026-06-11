@@ -1,5 +1,5 @@
-# Use lightweight Debian slim on ARM64 for OpenCV compatibility
-FROM python:3.11-slim
+# Use lightweight Debian slim for OpenCV compatibility
+FROM python:3.13-slim
 
 # Add a non-root user
 RUN adduser --disabled-password --gecos "" scraperuser
@@ -8,7 +8,10 @@ RUN adduser --disabled-password --gecos "" scraperuser
 WORKDIR /app
 
 # Install system dependencies for OpenCV
-RUN apt-get update && apt-get install -y libglib2.0-0 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libglib2.0-0 \
+    libgl1 \
+    && rm -rf /var/lib/apt/lists/*
 
 # Install dependencies
 COPY requirements.txt .
