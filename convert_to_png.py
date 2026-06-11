@@ -1,10 +1,13 @@
+import os
 import cv2
 import numpy as np
 import logging
 from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 
 def process_image(file_path, output_dir, tolerance=10):
     """
@@ -57,6 +60,8 @@ def process_image(file_path, output_dir, tolerance=10):
     if cv2.imwrite(str(png_path), img_bgra):
         return True, transparency_ratio
     
+    # BUG-5: Log on write failure instead of returning silently
+    logging.error(f"Failed to write output PNG: {png_path}")
     return False, 0.0
 
 def convert_with_safety(file_path, output_dir):
@@ -85,24 +90,51 @@ def convert_with_safety(file_path, output_dir):
     
     return False
 
+
+def _worker(args):
+    """Top-level worker function for ProcessPoolExecutor (must be picklable)."""
+    file_path, output_dir = args
+    return convert_with_safety(file_path, output_dir)
+
+
 def main():
-    downloads_dir = Path("/app/downloads")
-    processed_dir = Path("/app/processed")
+    # REF-2: Use environment variables with sensible container/local fallbacks
+    downloads_dir = Path(os.environ.get("SCRAPER_DOWNLOADS_DIR", "/app/downloads"))
+    processed_dir = Path(os.environ.get("SCRAPER_PROCESSED_DIR", "/app/processed"))
     processed_dir.mkdir(parents=True, exist_ok=True)
 
-    jpg_files = list(downloads_dir.glob("*.jpg"))
-    if not jpg_files:
-        logging.warning("No .jpg files found.")
+    # REF-6: Case-insensitive glob to catch .jpg, .JPG, .jpeg, etc.
+    image_files = (
+        list(downloads_dir.glob("*.jpg"))
+        + list(downloads_dir.glob("*.JPG"))
+        + list(downloads_dir.glob("*.jpeg"))
+        + list(downloads_dir.glob("*.JPEG"))
+    )
+    if not image_files:
+        logging.warning("No .jpg/.jpeg files found.")
         return
 
-    logging.info(f"Starting safety-optimized conversion for {len(jpg_files)} images...")
+    logging.info(f"Starting safety-optimized conversion for {len(image_files)} images...")
 
+    # OPT-3: Parallel processing with ProcessPoolExecutor
+    # Use half of available CPUs (minimum 1) to leave headroom
+    max_workers = max(1, (os.cpu_count() or 1) // 2)
     success_count = 0
-    for jpg_file in jpg_files:
-        if convert_with_safety(jpg_file, processed_dir):
-            success_count += 1
 
-    logging.info(f"Finished. Successfully processed {success_count}/{len(jpg_files)} images.")
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_worker, (img, processed_dir)): img
+            for img in image_files
+        }
+        for future in as_completed(futures):
+            img = futures[future]
+            try:
+                if future.result():
+                    success_count += 1
+            except Exception as e:
+                logging.error(f"Error processing {img.name}: {e}")
+
+    logging.info(f"Finished. Successfully processed {success_count}/{len(image_files)} images.")
 
 if __name__ == "__main__":
     main()
