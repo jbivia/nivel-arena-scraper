@@ -1,6 +1,6 @@
 # Debian slim keeps OpenCV's shared-library dependencies simple.
 # Pin the patch version so rebuilds are reproducible; bump deliberately.
-FROM python:3.13.14-slim
+FROM python:3.14.6-slim
 
 # Fail fast, log immediately, and keep no bytecode cache in the image.
 ENV PYTHONUNBUFFERED=1 \
@@ -18,8 +18,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Dependencies first so the layer caches across code edits.
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+#
+# The lock file carries a SHA-256 for every artefact in the resolved tree, and
+# --require-hashes turns that into an enforced check: an index that serves a
+# different wheel than the one this lock was compiled against -- compromised,
+# MITM'd, or a maintainer force-replacing a release -- fails the build instead
+# of shipping into the image. It also implies --no-deps, so nothing outside the
+# lock can be pulled in.
+COPY requirements.lock .
+RUN pip install --no-cache-dir --require-hashes -r requirements.lock
 
 # Application code stays owned by root: the unprivileged runtime user can read
 # and execute it but cannot modify it.

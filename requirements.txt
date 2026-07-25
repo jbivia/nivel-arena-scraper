@@ -1,10 +1,16 @@
+# Direct runtime dependencies. This file is the one to edit; `make lock`
+# compiles it into requirements.lock, which is what actually gets installed --
+# fully resolved and hash-pinned, so a tampered or substituted artefact fails
+# the install instead of running.
 requests==2.34.2
 # Imported directly by main.py for the retry policy, so pinned explicitly
 # rather than left to float as a transitive dependency of requests.
 urllib3==2.7.0
 beautifulsoup4==4.15.0
-opencv-python-headless==4.13.0.92
-numpy==2.4.6
+opencv-python-headless==5.0.0.93
+# 2.5 dropped Python 3.11; pyproject.toml's floor is 3.12 for exactly that
+# reason, so this can stay on the newest series.
+numpy==2.5.1
 # [binary] ships libpq in the wheel, so the image needs no postgresql-client
 # package and the read-only container has no system library to keep in sync.
 psycopg[binary]==3.3.4

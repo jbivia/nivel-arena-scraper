@@ -17,8 +17,16 @@ LOAD_ENV = set -a; . ./.env; set +a;
 # prefer SCRAPER_DATABASE_URL_LOCAL (localhost) when .env defines one.
 LOAD_ENV_HOST = $(LOAD_ENV) export SCRAPER_DATABASE_URL="$${SCRAPER_DATABASE_URL_LOCAL:-$$SCRAPER_DATABASE_URL}";
 
+# Compiling the locks needs uv, which lives in the venv. Bootstrapping it is a
+# chicken-and-egg case -- `make venv` installs from a lock -- so `make lock`
+# falls back to a hash-pinned pip install of uv alone.
+UV = $(VENV)/bin/uv
+UV_COMPILE = $(UV) pip compile --universal --generate-hashes --no-annotate \
+             --python-version 3.12 --custom-compile-command "make lock"
+
 .PHONY: help setup build up up-d convert down logs shell \
-        venv test test-db-up test-db-down lint fmt audit check \
+        venv lock lock-upgrade verify-locks test test-db-up test-db-down \
+        lint fmt audit check \
         repair-db repair-db-apply import-sqlite import-sqlite-apply \
         backfill-metadata backfill-metadata-apply \
         purge-db purge-downloads
@@ -30,6 +38,9 @@ setup: ## Initialize host directories and the .env file
 	mkdir -p downloads processed
 	chmod 755 downloads processed
 	@test -f .env || { cp .env.example .env; echo "Created .env -- set SCRAPER_DATABASE_URL before running."; }
+	@# .env holds the database password; the default 0644 leaves it readable by
+	@# every account on the machine. Reapplied on each run, not just on creation.
+	@chmod 600 .env
 
 # --- container ---------------------------------------------------------------
 
@@ -56,9 +67,19 @@ shell: ## Open a shell inside the running container
 
 # --- development -------------------------------------------------------------
 
-venv: ## Create a local virtualenv with dev dependencies
+venv: ## Create a local virtualenv from the hash-pinned dev lock
 	$(PYTHON) -m venv $(VENV)
-	$(VENV)/bin/pip install -q -r requirements-dev.txt
+	$(VENV)/bin/pip install -q --require-hashes -r requirements-dev.lock
+
+lock: ## Recompile the hash-pinned lock files from requirements*.txt
+	@test -x $(UV) || $(VENV)/bin/pip install -q "uv==$$(sed -n 's/^uv==//p' requirements-dev.txt)"
+	$(UV_COMPILE) requirements.txt -o requirements.lock
+	$(UV_COMPILE) requirements-dev.txt -o requirements-dev.lock
+
+lock-upgrade: ## Recompile the locks, taking the newest allowed transitive versions
+	@test -x $(UV) || $(VENV)/bin/pip install -q "uv==$$(sed -n 's/^uv==//p' requirements-dev.txt)"
+	$(UV_COMPILE) --upgrade requirements.txt -o requirements.lock
+	$(UV_COMPILE) --upgrade requirements-dev.txt -o requirements-dev.lock
 
 test: ## Run the test suite (DB tests skip unless SCRAPER_TEST_DATABASE_URL is set)
 	$(VENV)/bin/pytest
@@ -82,10 +103,21 @@ fmt: ## Auto-format and auto-fix
 	$(VENV)/bin/ruff format .
 	$(VENV)/bin/ruff check --fix .
 
-audit: ## Scan dependencies for known vulnerabilities
-	$(VENV)/bin/pip-audit -r requirements.txt
+audit: ## Scan the runtime and dev dependency trees for known vulnerabilities
+	$(VENV)/bin/pip-audit --strict -r requirements.lock
+	$(VENV)/bin/pip-audit --strict -r requirements-dev.lock
 
-check: lint test audit ## Run the full local verification suite
+verify-locks: ## Fail if a lock has drifted from its requirements file
+	@test -x $(UV) || $(VENV)/bin/pip install -q "uv==$$(sed -n 's/^uv==//p' requirements-dev.txt)"
+	@tmp=$$(mktemp -d); cp requirements.lock requirements-dev.lock $$tmp/; \
+		$(UV_COMPILE) requirements.txt -o $$tmp/requirements.lock >/dev/null 2>&1; \
+		$(UV_COMPILE) requirements-dev.txt -o $$tmp/requirements-dev.lock >/dev/null 2>&1; \
+		diff -u requirements.lock $$tmp/requirements.lock && \
+		diff -u requirements-dev.lock $$tmp/requirements-dev.lock && \
+		echo "Locks are in sync."; \
+		status=$$?; rm -rf $$tmp; exit $$status
+
+check: lint test verify-locks audit ## Run the full local verification suite
 
 # --- maintenance -------------------------------------------------------------
 

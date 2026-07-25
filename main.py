@@ -50,6 +50,18 @@ REQUEST_TIMEOUT = (10, 30)
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 DOWNLOAD_CHUNK_SIZE = 65536
 
+# Same idea for HTML. A board page is ~50 KB and a detail fragment a few KB, so
+# 8 MB never refuses a real response while keeping a hostile one from being
+# read into memory in full.
+MAX_HTML_BYTES = 8 * 1024 * 1024
+
+# Charset out of a Content-Type header, e.g. 'text/html; charset=utf-8'.
+_CHARSET_RE = re.compile(r"charset=([\w.:-]+)", re.IGNORECASE)
+
+# Jitter around a list-page fetch. Shorter than the per-card delay: one page
+# yields many cards, each of which is already rate-limited on its own.
+LIST_PAGE_DELAY = (2.0, 5.0)
+
 # JPEG SOI marker. Guards against an HTML error page served with a 200.
 JPEG_MAGIC = b"\xff\xd8\xff"
 
@@ -188,6 +200,14 @@ class CatalogueTableMissing(RuntimeError):
     """Raised when the app's ``cards`` table is absent or predates this scraper."""
 
 
+class OffHostRedirect(RuntimeError):
+    """Raised when a response came from a host other than the configured board."""
+
+
+class ResponseTooLarge(RuntimeError):
+    """Raised when a response body exceeded its size cap."""
+
+
 class NivelArenaScraper:
     def __init__(
         self,
@@ -226,7 +246,6 @@ class NivelArenaScraper:
         # against a database the tracker app is also using; the one multi-row
         # operation (repair_filenames) opens an explicit transaction instead.
         self._conn.autocommit = True
-        self._init_db()
 
         self.session = requests.Session()
         adapter = HTTPAdapter(max_retries=DEFAULT_RETRY)
@@ -246,7 +265,16 @@ class NivelArenaScraper:
             }
         )
 
-        self._robots = self._load_robots() if obey_robots else None
+        # Anything that can fail goes here, behind a cleanup: the caller of a
+        # constructor that raised never receives an object to close, so a
+        # failure past this point would otherwise strand the connection open
+        # against the database the tracker app is also using.
+        try:
+            self._init_db()
+            self._robots = self._load_robots() if obey_robots else None
+        except BaseException:
+            self.close()
+            raise
 
     def __enter__(self):
         return self
@@ -256,13 +284,20 @@ class NivelArenaScraper:
         return False
 
     def close(self):
-        """Explicitly release all held resources."""
-        if self._conn:
-            self._conn.close()
-            self._conn = None
-        if self.session:
-            self.session.close()
-            self.session = None
+        """Explicitly release all held resources. Safe to call more than once."""
+        conn, self._conn = self._conn, None
+        if conn is not None:
+            conn.close()
+
+        session, self.session = self.session, None
+        if session is not None:
+            session.close()
+
+    def _polite_sleep(self, low, high):
+        """Pause for a jittered interval so requests are never evenly spaced."""
+        delay = random.uniform(low, high)  # noqa: S311 - politeness jitter, not a secret
+        log.info("Sleeping %.2fs to respect rate limits...", delay)
+        time.sleep(delay)
 
     # --- robots -----------------------------------------------------------
 
@@ -432,12 +467,41 @@ class NivelArenaScraper:
 
     # --- http -------------------------------------------------------------
 
+    def _fetch_soup(self, method, url, **kwargs):
+        """Fetch one HTML document from the board and parse it.
+
+        Streamed and capped rather than read in one go: ``response.text`` pulls
+        the whole body into memory before anything can object to its size, and
+        over plaintext HTTP the length is whatever the wire says it is. The
+        final host is re-checked for the same reason downloads check it --
+        a redirect is trivially injected on an unauthenticated hop.
+        """
+        with self.session.request(method, url, stream=True, timeout=REQUEST_TIMEOUT, **kwargs) as response:
+            response.raise_for_status()
+
+            final_host = urlparse(response.url).netloc
+            if final_host != self.base_host:
+                raise OffHostRedirect(f"{url} redirected off-host to {response.url}")
+
+            body = bytearray()
+            for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
+                body += chunk
+                if len(body) > MAX_HTML_BYTES:
+                    raise ResponseTooLarge(f"{url} body exceeded {MAX_HTML_BYTES} bytes")
+
+            declared = _CHARSET_RE.search(response.headers.get("Content-Type", ""))
+
+        # Handed over as bytes: requests decodes an undeclared text/* body as
+        # ISO-8859-1 per the HTTP spec, which would mangle the Korean this board
+        # is written in. BeautifulSoup reads the meta charset instead.
+        return BeautifulSoup(
+            bytes(body), "html.parser", from_encoding=declared.group(1) if declared else None
+        )
+
     def get_html(self, url):
         log.info("Fetching list page: %s", url)
-        time.sleep(random.uniform(2, 5))  # noqa: S311 - politeness jitter, not a secret
-        response = self.session.get(url, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
-        return BeautifulSoup(response.text, "html.parser")
+        self._polite_sleep(*LIST_PAGE_DELAY)
+        return self._fetch_soup("GET", url)
 
     def get_card_details(self, wr_id):
         payload = {"bo_table": self.board_id, "wr_id": wr_id}
@@ -449,9 +513,7 @@ class NivelArenaScraper:
         }
 
         log.info("Fetching details for wr_id %s", wr_id)
-        response = self.session.post(self.ajax_url, data=payload, headers=headers, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
-        return BeautifulSoup(response.text, "html.parser")
+        return self._fetch_soup("POST", self.ajax_url, data=payload, headers=headers)
 
     def _reserve_filename(self, filename):
         """Return an unused path for ``filename``, suffixing -01..-99 on clash."""
@@ -459,9 +521,8 @@ class NivelArenaScraper:
         if not filepath.exists():
             return filepath
 
-        stem, ext = os.path.splitext(filename)
         for i in range(1, 100):
-            candidate = self.downloads_dir / f"{stem}-{i:02d}{ext}"
+            candidate = self.downloads_dir / f"{filepath.stem}-{i:02d}{filepath.suffix}"
             if not candidate.exists():
                 log.info("Duplicate found. Saving %s as %s", filename, candidate.name)
                 return candidate
@@ -510,7 +571,7 @@ class NivelArenaScraper:
             tmp_path = filepath.with_name(filepath.name + ".part")
             written = 0
             try:
-                with open(tmp_path, "wb") as handle:
+                with tmp_path.open("wb") as handle:
                     for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
                         if not chunk:
                             continue
@@ -527,7 +588,7 @@ class NivelArenaScraper:
                     log.error("Refusing %s: empty response body.", img_url)
                     return None
 
-                os.replace(tmp_path, filepath)
+                tmp_path.replace(filepath)
             finally:
                 tmp_path.unlink(missing_ok=True)
 
@@ -537,6 +598,13 @@ class NivelArenaScraper:
     # --- orchestration ----------------------------------------------------
 
     def scrape_board(self, max_pages=None):
+        # Every card goes through the detail endpoint, so a board walk that is
+        # not allowed to call it has nothing to do. Asked once here rather than
+        # once per card, as the backfill does.
+        if not self._may_fetch(self.ajax_url):
+            log.error("robots.txt disallows the detail endpoint %s; nothing to scrape.", self.ajax_url)
+            return
+
         page = 1
         consecutive_failures = 0
 
@@ -583,10 +651,7 @@ class NivelArenaScraper:
                     continue
 
                 self.scrape_card(wr_id, img_filename)
-
-                delay = random.uniform(self.min_delay, self.max_delay)  # noqa: S311 - politeness jitter
-                log.info("Sleeping %.2fs to respect rate limits...", delay)
-                time.sleep(delay)
+                self._polite_sleep(self.min_delay, self.max_delay)
 
             page += 1
 
@@ -671,9 +736,7 @@ class NivelArenaScraper:
         processed, failures, consecutive_failures = 0, 0, 0
         for index, (wr_id, image_filename) in enumerate(rows):
             if index:
-                delay = random.uniform(self.min_delay, self.max_delay)  # noqa: S311 - politeness jitter
-                log.info("Sleeping %.2fs to respect rate limits...", delay)
-                time.sleep(delay)
+                self._polite_sleep(self.min_delay, self.max_delay)
 
             try:
                 details = card_metadata.parse_card_details(self.get_card_details(wr_id))
@@ -813,6 +876,24 @@ def _env_float(name, default):
         return default
 
 
+def _env_int(name, default):
+    """Read an integer setting. A malformed value falls back to ``default``.
+
+    Not a raise: these are read while the parser is being built, where an
+    exception surfaces as a traceback with no indication of which variable was
+    at fault.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning("Ignoring %s=%r: not an integer.", name, raw)
+        return default
+
+
 def build_arg_parser():
     parser = argparse.ArgumentParser(description="Scrape trading card images from a GnuBoard5 board.")
     parser.add_argument(
@@ -828,7 +909,7 @@ def build_arg_parser():
     parser.add_argument(
         "--max-pages",
         type=int,
-        default=int(os.environ["SCRAPER_MAX_PAGES"]) if os.environ.get("SCRAPER_MAX_PAGES") else None,
+        default=_env_int("SCRAPER_MAX_PAGES", None),
         help="Stop after N pages (env: SCRAPER_MAX_PAGES). Default: all pages.",
     )
     parser.add_argument(
@@ -885,15 +966,16 @@ def build_arg_parser():
 
 
 def main(argv=None):
-    args = build_arg_parser().parse_args(argv)
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
     if args.min_delay > args.max_delay:
-        build_arg_parser().error("--min-delay must not exceed --max-delay")
+        parser.error("--min-delay must not exceed --max-delay")
 
     if args.backfill_limit is not None and args.backfill_limit < 1:
-        build_arg_parser().error("--backfill-limit must be at least 1")
+        parser.error("--backfill-limit must be at least 1")
 
     # These maintenance modes never touch the network, so they never need
     # robots.txt. --backfill-metadata is not among them: it makes real requests,

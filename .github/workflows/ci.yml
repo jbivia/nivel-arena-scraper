@@ -12,13 +12,17 @@ on:
 permissions:
   contents: read
 
+# Third-party actions are pinned to a commit SHA, not a tag: a tag is mutable
+# and whoever controls the action repository can repoint it at new code that
+# would then run with this workflow's token. The trailing comment records which
+# release each SHA is, so bumping stays readable.
 jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.12", "3.13", "3.14"]
 
     # The scraper's SQL is PostgreSQL-specific, so the database tests run
     # against a real server rather than a stand-in.
@@ -36,15 +40,17 @@ jobs:
           --health-retries 10
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.0.0
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.0.0
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
+      # Hash-enforced: a substituted artefact fails the install rather than
+      # running in CI. See requirements.lock.
       - name: Install dependencies
-        run: pip install -r requirements-dev.txt
+        run: pip install --require-hashes -r requirements-dev.lock
 
       - name: Lint
         run: |
@@ -56,25 +62,57 @@ jobs:
           SCRAPER_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
         run: pytest
 
-  audit:
+  # Dependency integrity is a build requirement, not a convention: this job
+  # fails the build when a lock drifts from its requirements file, when a pin
+  # is unhashed, or when anything in either tree has a known CVE.
+  dependencies:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.0.0
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.0.0
         with:
-          python-version: "3.13"
+          python-version: "3.14"
 
-      - name: Install pip-audit
-        run: pip install pip-audit==2.10.1
+      - name: Install audit tooling
+        run: pip install --require-hashes -r requirements-dev.lock
 
-      - name: Scan pinned dependencies for known vulnerabilities
-        run: pip-audit -r requirements.txt
+      # A lock that no longer matches its requirements file is a lock nobody is
+      # actually installing from, so recompiling must be a no-op. The current
+      # lock is seeded into the scratch copy first: uv reuses the pins it finds
+      # there, so this reports a stale lock rather than every upstream release
+      # that happened since it was compiled (`make lock-upgrade` is for those).
+      - name: Verify the lock files are in sync with their requirements
+        run: |
+          cp requirements.lock requirements-dev.lock /tmp/
+          uv pip compile requirements.txt --universal --generate-hashes \
+            --no-annotate --python-version 3.12 --custom-compile-command "make lock" \
+            -o /tmp/requirements.lock
+          uv pip compile requirements-dev.txt --universal --generate-hashes \
+            --no-annotate --python-version 3.12 --custom-compile-command "make lock" \
+            -o /tmp/requirements-dev.lock
+          diff -u requirements.lock /tmp/requirements.lock
+          diff -u requirements-dev.lock /tmp/requirements-dev.lock
+
+      # --require-hashes refuses to install anything unhashed, so a resolvable
+      # dry run is proof that every artefact in the tree is pinned by digest.
+      - name: Verify every pin carries a hash
+        run: |
+          pip install --require-hashes --dry-run --quiet -r requirements.lock
+          pip install --require-hashes --dry-run --quiet -r requirements-dev.lock
+
+      - name: Scan the runtime tree for known vulnerabilities
+        run: pip-audit --strict -r requirements.lock
+
+      # Dev tooling runs on developer machines and on this runner, with the
+      # repository checked out, so a CVE there matters too.
+      - name: Scan the dev tree for known vulnerabilities
+        run: pip-audit --strict -r requirements-dev.lock
 
   container:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.0.0
 
       - name: Build image
         run: docker build -t nivel-arena-scraper:ci -f Containerfile .

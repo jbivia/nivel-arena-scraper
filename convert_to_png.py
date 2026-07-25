@@ -11,13 +11,13 @@ import os
 # caps how large an image the decoders will allocate (decompression bombs).
 os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", str(64 * 1024 * 1024))
 
-import argparse  # noqa: E402
-import logging  # noqa: E402
-from concurrent.futures import ProcessPoolExecutor, as_completed  # noqa: E402
-from pathlib import Path  # noqa: E402
+import argparse
+import logging
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
 
-import cv2  # noqa: E402
-import numpy as np  # noqa: E402
+import cv2
+import numpy as np
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger("convert")
@@ -47,7 +47,15 @@ def process_image(file_path, output_dir, tolerance=DEFAULT_TOLERANCE):
     # core oversubscribes the machine by workers x cores.
     cv2.setNumThreads(1)
 
-    img = cv2.imread(str(file_path), cv2.IMREAD_COLOR)
+    # A decode that trips OPENCV_IO_MAX_IMAGE_PIXELS raises out of the native
+    # layer rather than returning None, so the bomb guard only actually guards
+    # if that is caught here: uncaught, it would take the worker down with it.
+    try:
+        img = cv2.imread(str(file_path), cv2.IMREAD_COLOR)
+    except cv2.error as exc:
+        log.error("Refusing %s: decoder rejected it (%s)", file_path.name, exc)
+        return False, 0.0
+
     if img is None:
         log.error("Could not read image: %s", file_path)
         return False, 0.0
