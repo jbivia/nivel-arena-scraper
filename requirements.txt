@@ -1,4 +1,7 @@
 requests==2.34.2
+# Imported directly by main.py for the retry policy, so pinned explicitly
+# rather than left to float as a transitive dependency of requests.
+urllib3==2.7.0
 beautifulsoup4==4.15.0
 opencv-python-headless==4.13.0.92
 numpy==2.4.6
