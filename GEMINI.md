@@ -6,7 +6,8 @@ A Python web scraper that extracts high-resolution trading card images from `niv
 
 - **Purpose**: Automate the collection of trading card images and metadata.
 - **Main Technologies**:
-  - **Python 3.13**: Core scripting language.
+  - **Python 3.12+** (3.14 in the container image): Core scripting language. The floor is the
+    lowest version on which every dependency can be held at its newest release.
   - **Requests**: HTTP requests and AJAX calls.
   - **BeautifulSoup4**: HTML parsing.
   - **OpenCV** (`opencv-python-headless`): Background removal.
@@ -60,7 +61,7 @@ podman compose down
 Or run directly on the host:
 
 ```bash
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+python3 -m venv .venv && .venv/bin/pip install --require-hashes -r requirements.lock
 SCRAPER_DATABASE_URL=postgres://nivel:...@localhost:5432/nivel \
 SCRAPER_DOWNLOADS_DIR=downloads \
 SCRAPER_PROCESSED_DIR=processed \
@@ -70,9 +71,10 @@ SCRAPER_PROCESSED_DIR=processed \
 ## Development
 
 ```bash
-make venv        # create .venv with dev dependencies
+make venv        # create .venv from the hash-pinned dev lock
 make test-db-up  # throwaway PostgreSQL for the DB tests, on port 55432
-make check       # lint + tests + dependency CVE audit
+make check       # lint + tests + lock drift check + dependency CVE audit
+make lock        # recompile the locks after editing requirements*.txt
 ```
 
 Tests live in `tests/` and import `main` / `convert_to_png` directly (`pythonpath = ["."]` in `pyproject.toml`). The OpenCV tests skip automatically if `cv2` is not installed; the database tests skip unless `SCRAPER_TEST_DATABASE_URL` points at a reachable PostgreSQL, and each one runs in its own throwaway schema.
@@ -83,7 +85,8 @@ All settings are CLI flags or environment variables — nothing requires editing
 
 ## Development Conventions
 
-- **Security**: The target site is HTTP-only, so all responses are treated as untrusted: size caps, content-type and magic-byte validation, cross-host redirect refusal, and filename sanitization. The container runs as non-root with a read-only rootfs and all capabilities dropped.
+- **Security**: The target site is HTTP-only, so all responses are treated as untrusted: size caps (images *and* HTML), content-type and magic-byte validation, cross-host redirect refusal on every request, and filename sanitization. The container runs as non-root with a read-only rootfs and all capabilities dropped.
+- **Dependencies**: `requirements*.txt` hold the direct pins and are what you edit; `requirements*.lock` are the compiled, fully-resolved, SHA-256-pinned trees that the container, CI and `make venv` install from with `pip install --require-hashes`. Run `make lock` after any dependency change — CI fails on lock drift, on an unhashed pin, and on a known CVE in either tree.
 - **Persistence**: Images in `./downloads`, PNGs in `./processed`, history in the `scraped_cards` PostgreSQL table and card fields in `cards` (owned by the tracker app's migrations; run `make db-migrate` there before the first scrape). The connection is autocommit so a long scrape never holds an idle transaction open against a database the tracker app shares; `repair_filenames` and the SQLite import open explicit transactions.
 - **Credentials**: `SCRAPER_DATABASE_URL` is environment-only and deliberately has no CLI flag (`argv` is world-readable via `/proc`). It comes from `.env`, which is gitignored; `redact_conninfo()` strips the password before anything is logged.
 - **Error Handling**: All HTTP calls carry timeouts; transient errors (429, 5xx) retry with exponential backoff; a run survives isolated page failures and gives up after `MAX_CONSECUTIVE_PAGE_FAILURES`.

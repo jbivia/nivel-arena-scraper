@@ -62,6 +62,11 @@ def stub_get(scraper, response):
     scraper.session.get = lambda *a, **kw: response
 
 
+def stub_request(scraper, response):
+    """Stub the session method `_fetch_soup` goes through."""
+    scraper.session.request = lambda *a, **kw: response
+
+
 class TestConnectionConfig:
     """These need no database: they cover the paths taken before one is opened."""
 
@@ -452,6 +457,81 @@ class TestDownloadImage:
         stub_get(scraper, FakeResponse(body=b"<html>nope</html>"))
         scraper.download_image("http://example.test/a.jpg", "x.jpg")
         assert not any(p.name.endswith(".part") for p in scraper.downloads_dir.iterdir())
+
+
+class TestFetchSoup:
+    """The board speaks plaintext HTTP, so its HTML is bounded and host-checked."""
+
+    @staticmethod
+    def _html(body, content_type="text/html; charset=utf-8", url="http://example.test/p"):
+        return FakeResponse(body=body, headers={"Content-Type": content_type}, url=url)
+
+    def test_parses_a_normal_page(self, scraper):
+        stub_request(scraper, self._html("<div id='subject'>누아르</div>".encode()))
+        soup = scraper.get_html("http://example.test/bbs/board.php")
+        assert soup.select_one("#subject").get_text() == "누아르"
+
+    def test_rejects_off_host_redirect(self, scraper):
+        stub_request(scraper, self._html(b"<html>hi</html>", url="http://evil.test/p"))
+        with pytest.raises(main.OffHostRedirect):
+            scraper.get_html("http://example.test/bbs/board.php")
+
+    def test_detail_endpoint_rejects_off_host_redirect(self, scraper):
+        stub_request(scraper, self._html(b"<html>hi</html>", url="http://evil.test/p"))
+        with pytest.raises(main.OffHostRedirect):
+            scraper.get_card_details("1")
+
+    def test_rejects_oversized_body(self, scraper, monkeypatch):
+        monkeypatch.setattr(main, "MAX_HTML_BYTES", 1024)
+        stub_request(scraper, self._html(b"<p>x</p>" * 4096))
+        with pytest.raises(main.ResponseTooLarge):
+            scraper.get_html("http://example.test/bbs/board.php")
+
+    def test_undeclared_charset_does_not_mangle_korean(self, scraper):
+        # requests would decode a text/* body with no charset as ISO-8859-1.
+        body = "<meta charset='utf-8'><div id='subject'>누아르</div>".encode()
+        stub_request(scraper, self._html(body, content_type="text/html"))
+        soup = scraper.get_html("http://example.test/bbs/board.php")
+        assert soup.select_one("#subject").get_text() == "누아르"
+
+    def test_declared_charset_is_honoured(self, scraper):
+        body = "<div id='subject'>누아르</div>".encode("euc-kr")
+        stub_request(scraper, self._html(body, content_type="text/html; charset=euc-kr"))
+        soup = scraper.get_html("http://example.test/bbs/board.php")
+        assert soup.select_one("#subject").get_text() == "누아르"
+
+    def test_a_nonsense_declared_charset_does_not_break_parsing(self, scraper):
+        # The header is attacker-controlled on an unauthenticated hop.
+        body = "<div id='subject'>누아르</div>".encode()
+        stub_request(scraper, self._html(body, content_type="text/html; charset=not-a-charset"))
+        soup = scraper.get_html("http://example.test/bbs/board.php")
+        assert soup.select_one("#subject").get_text() == "누아르"
+
+
+class TestRobots:
+    class _Disallowing:
+        def can_fetch(self, agent, url):
+            return False
+
+    def test_a_disallowed_detail_endpoint_stops_the_board_walk(self, scraper, monkeypatch):
+        # Every card goes through it, so there is nothing to walk without it.
+        scraper._robots = self._Disallowing()
+
+        def explode(url):
+            raise AssertionError("no page should be fetched")
+
+        monkeypatch.setattr(scraper, "get_html", explode)
+        scraper.scrape_board()
+
+
+class TestEnvironmentSettings:
+    def test_malformed_integer_falls_back_to_the_default(self, monkeypatch):
+        monkeypatch.setenv("SCRAPER_MAX_PAGES", "not-a-number")
+        assert main.build_arg_parser().parse_args([]).max_pages is None
+
+    def test_valid_integer_is_used(self, monkeypatch):
+        monkeypatch.setenv("SCRAPER_MAX_PAGES", "7")
+        assert main.build_arg_parser().parse_args([]).max_pages == 7
 
 
 class TestRepairFilenames:

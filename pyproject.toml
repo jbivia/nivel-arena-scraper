@@ -1,22 +1,49 @@
 [project]
 name = "nivel-arena-scraper"
-version = "1.0.0"
+# 1.0.0 recorded the source filename in image_filename; 2.0.0 moved scrape
+# history from SQLite to PostgreSQL; 2.1.0 added the `cards` catalogue. Both
+# earlier boundaries are referenced by the migration paths in README.md.
+version = "2.1.0"
 description = "Scraper and image post-processor for NivelArena trading cards"
-requires-python = ">=3.11"
-license = { file = "LICENSE" }
+readme = "README.md"
+# 3.12 is the floor because it is the lowest version on which every dependency
+# can be held at its newest release -- numpy 2.5 dropped 3.11. Raising it any
+# further would narrow the support matrix without buying a newer package.
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+classifiers = [
+    "Private :: Do Not Upload",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+
+# There is deliberately no [build-system]: nothing here is packaged or
+# installed. Dependencies live in requirements*.txt and are installed from the
+# hash-pinned requirements*.lock -- see the dependency section of README.md.
 
 [tool.pytest.ini_options]
+minversion = "9.0"
 testpaths = ["tests"]
 pythonpath = ["."]
-addopts = "-q --strict-markers"
+# --strict-markers rejects a typo'd @pytest.mark; --strict-config rejects a
+# typo'd key in this very block, which would otherwise be silently ignored.
+addopts = "-q --strict-markers --strict-config"
+xfail_strict = true
+# Warnings are failures. A DeprecationWarning out of requests, urllib3 or
+# psycopg is the earliest signal that a pinned dependency is drifting toward a
+# breaking change, and it is worth nothing if it scrolls past in green output.
+filterwarnings = ["error"]
 
 [tool.ruff]
 line-length = 110
-target-version = "py311"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = [
-    "E",    # pycodestyle
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
     "F",    # pyflakes
     "I",    # import sorting
     "B",    # bugbear
@@ -24,13 +51,48 @@ select = [
     "S",    # bandit security rules
     "C4",   # comprehensions
     "SIM",  # simplifications
+    "N",    # pep8 naming
+    "A",    # shadowed builtins
+    "RUF",  # ruff's own rules -- RUF100 catches noqa left behind after a fix
+    "G",    # logging call format: no f-strings, no eager %-interpolation
+    "LOG",  # logging misuse
+    "T20",  # no print(): this pipeline runs in a container and logs
+    "DTZ",  # naive datetimes
+    "PTH",  # pathlib over os.path
+    "SLF",  # private member access across objects
+    "TID",  # tidy imports (relative imports are banned below)
+    "ISC",  # implicit string concatenation
+    "PIE",  # misc lint
+    "RET",  # return-statement simplifications
+    "PERF", # obvious performance traps
+    "FURB", # modern-Python refurbishments
+    "ICN",  # conventional import aliases
+    "EXE",  # shebang/executable-bit mismatches
+    "Q",    # quote consistency
+    "PLE",  # pylint errors
+    "PLW",  # pylint warnings
 ]
 ignore = [
     "S101",  # assert is fine in tests
     "E501",  # long lines are handled by the formatter
+    # N818 wants every exception named `...Error`. These read as the condition
+    # they describe (`CatalogueTableMissing`, `OffHostRedirect`) and are matched
+    # by name in the tests; the suffix would add length, not clarity.
+    "N818",
 ]
 
 [tool.ruff.lint.per-file-ignores]
 # Tests intentionally construct hostile inputs and touch private attributes.
 # SIM300: `value == pytest.approx(x)` is the documented pytest form, not a Yoda condition.
 "tests/*" = ["S105", "S106", "SLF001", "SIM300"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+# The modules sit at the repo root and are imported by name; a relative import
+# would only ever be a mistake.
+ban-relative-imports = "all"
+
+[tool.ruff.lint.isort]
+known-first-party = ["card_metadata", "convert_to_png", "main"]
+
+[tool.ruff.format]
+docstring-code-format = true
