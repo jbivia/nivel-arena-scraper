@@ -20,8 +20,12 @@ services:
     mem_limit: 2g
     pids_limit: 256
 
+    # Holds SCRAPER_DATABASE_URL. `make setup` seeds it from .env.example;
+    # the credentials never belong in this file or in argv.
+    env_file:
+      - .env
+
     environment:
-      SCRAPER_DB_PATH: /app/data/scraper.db
       SCRAPER_DOWNLOADS_DIR: /app/downloads
       SCRAPER_PROCESSED_DIR: /app/processed
 
@@ -29,4 +33,14 @@ services:
       # :Z relabels for SELinux; keep-id maps the host UID under rootless Podman.
       - ./downloads:/app/downloads:Z
       - ./processed:/app/processed:Z
-      - ./data:/app/data:Z
+
+    networks:
+      - nivel
+
+networks:
+  # PostgreSQL lives in the nivel-arena-collection-tracker stack; joining its
+  # network is what makes the `nivel-db` hostname resolve. Start it there first
+  # (`make up` in that repo) -- this compose file does not own the database.
+  nivel:
+    external: true
+    name: nivel-arena-collection-tracker_default

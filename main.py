@@ -3,6 +3,10 @@
 The target site is served over plaintext HTTP only (it has no TLS listener), so
 every response has to be treated as untrusted input: sizes are capped, content
 types are checked, and cross-host redirects are refused.
+
+Scrape progress is tracked in PostgreSQL. The connection string is read from
+``SCRAPER_DATABASE_URL`` and is deliberately not exposed as a CLI flag: argv is
+world-readable in ``/proc``, and the URL carries the password.
 """
 
 import argparse
@@ -14,9 +18,10 @@ import sqlite3
 import time
 import unicodedata
 from pathlib import Path
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlparse, urlunparse
 from urllib.robotparser import RobotFileParser
 
+import psycopg
 import requests
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
@@ -60,6 +65,42 @@ DEFAULT_RETRY = Retry(
 # Give up on a board after this many consecutive page failures rather than
 # aborting the whole run on the first transient error.
 MAX_CONSECUTIVE_PAGE_FAILURES = 3
+
+# Environment variable holding the libpq connection URL, e.g.
+# postgres://user:password@nivel-db:5432/nivel
+DATABASE_URL_ENV = "SCRAPER_DATABASE_URL"
+
+# Seconds to wait for the PostgreSQL TCP connect. Without it a wedged host
+# leaves the scraper hanging on startup indefinitely.
+DB_CONNECT_TIMEOUT = 10
+
+# Shows up in pg_stat_activity, so a long-running scrape is identifiable from
+# the tracker's side of the same database.
+DB_APPLICATION_NAME = "nivel-arena-scraper"
+
+
+def redact_conninfo(url):
+    """Return ``url`` with any password replaced, safe to log.
+
+    Anything unparseable is reduced to a placeholder rather than echoed: a
+    malformed URL is exactly the case where the password might land in a
+    surprising position.
+    """
+    try:
+        parts = urlparse(url)
+    except ValueError:
+        return "<unparseable connection string>"
+
+    if not parts.hostname:
+        return "<connection string>"
+
+    netloc = parts.hostname
+    if parts.port:
+        netloc = f"{netloc}:{parts.port}"
+    if parts.username:
+        netloc = f"{parts.username}:***@{netloc}" if parts.password else f"{parts.username}@{netloc}"
+
+    return urlunparse((parts.scheme, netloc, parts.path, "", "", ""))
 
 
 def safe_stem(raw, fallback):
@@ -105,12 +146,16 @@ def parse_card_link(href):
     return img_filename, wr_id
 
 
+class DatabaseNotConfigured(RuntimeError):
+    """Raised when no PostgreSQL connection string is available."""
+
+
 class NivelArenaScraper:
     def __init__(
         self,
         base_url,
         board_id,
-        db_path=None,
+        database_url=None,
         downloads_dir=None,
         min_delay=5.0,
         max_delay=10.0,
@@ -124,12 +169,25 @@ class NivelArenaScraper:
         self.min_delay = min_delay
         self.max_delay = max_delay
 
-        self.db_path = Path(db_path or os.environ.get("SCRAPER_DB_PATH", "/app/data/scraper.db"))
+        self.database_url = database_url or os.environ.get(DATABASE_URL_ENV, "")
+        if not self.database_url:
+            raise DatabaseNotConfigured(
+                f"No PostgreSQL connection configured -- set {DATABASE_URL_ENV}, e.g. "
+                f"{DATABASE_URL_ENV}=postgres://user:password@nivel-db:5432/nivel"
+            )
+
         self.downloads_dir = Path(downloads_dir or os.environ.get("SCRAPER_DOWNLOADS_DIR", "/app/downloads"))
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.downloads_dir.mkdir(parents=True, exist_ok=True)
 
-        self._conn = sqlite3.connect(self.db_path)
+        self._conn = psycopg.connect(
+            self.database_url,
+            connect_timeout=DB_CONNECT_TIMEOUT,
+            application_name=DB_APPLICATION_NAME,
+        )
+        # Autocommit keeps a long scrape from holding an idle transaction open
+        # against a database the tracker app is also using; the one multi-row
+        # operation (repair_filenames) opens an explicit transaction instead.
+        self._conn.autocommit = True
         self._init_db()
 
         self.session = requests.Session()
@@ -201,34 +259,31 @@ class NivelArenaScraper:
     # --- database ---------------------------------------------------------
 
     def _init_db(self):
-        # WAL keeps a reader from blocking the writer if the DB is inspected
-        # while a scrape is running.
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
+        # The scraper owns this table outright; it lives alongside the tracker
+        # app's drizzle-managed tables but is never touched by its migrations.
         self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS scraped_cards (
                 wr_id TEXT PRIMARY KEY,
                 card_id TEXT,
                 image_filename TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                scraped_at TIMESTAMPTZ NOT NULL DEFAULT now()
             )
             """
         )
-        self._conn.commit()
-        log.info("Database initialized at %s", self.db_path)
+        log.info("Database ready at %s", redact_conninfo(self.database_url))
 
     def is_already_scraped(self, wr_id):
-        cursor = self._conn.execute("SELECT 1 FROM scraped_cards WHERE wr_id = ?", (wr_id,))
+        cursor = self._conn.execute("SELECT 1 FROM scraped_cards WHERE wr_id = %s", (wr_id,))
         return cursor.fetchone() is not None
 
     def mark_as_scraped(self, wr_id, card_id, image_filename):
-        # OR IGNORE so a concurrent run cannot crash the scrape on a PK clash.
+        # DO NOTHING so a concurrent run cannot crash the scrape on a PK clash.
         self._conn.execute(
-            "INSERT OR IGNORE INTO scraped_cards (wr_id, card_id, image_filename) VALUES (?, ?, ?)",
+            "INSERT INTO scraped_cards (wr_id, card_id, image_filename) VALUES (%s, %s, %s)"
+            " ON CONFLICT (wr_id) DO NOTHING",
             (wr_id, card_id, image_filename),
         )
-        self._conn.commit()
 
     # --- http -------------------------------------------------------------
 
@@ -432,6 +487,7 @@ class NivelArenaScraper:
         claimed = {name for _, _, name in rows if name in on_disk}
 
         repaired, ambiguous, unresolved = 0, 0, 0
+        updates = []
         for wr_id, card_id, image_filename in rows:
             if image_filename in on_disk:
                 continue
@@ -442,11 +498,7 @@ class NivelArenaScraper:
             if len(candidates) == 1:
                 new_name = candidates[0]
                 log.info("Repair wr_id %s: %r -> %r", wr_id, image_filename, new_name)
-                if not dry_run:
-                    self._conn.execute(
-                        "UPDATE scraped_cards SET image_filename = ? WHERE wr_id = ?",
-                        (new_name, wr_id),
-                    )
+                updates.append((new_name, wr_id))
                 claimed.add(new_name)
                 repaired += 1
             elif len(candidates) > 1:
@@ -456,8 +508,14 @@ class NivelArenaScraper:
                 log.warning("wr_id %s (%s): no matching file on disk.", wr_id, card_id)
                 unresolved += 1
 
-        if not dry_run:
-            self._conn.commit()
+        # One transaction for the whole repair: a partially-applied rename pass
+        # is harder to reason about than one that either lands or does not.
+        if not dry_run and updates:
+            with self._conn.transaction(), self._conn.cursor() as cursor:
+                cursor.executemany(
+                    "UPDATE scraped_cards SET image_filename = %s WHERE wr_id = %s",
+                    updates,
+                )
 
         log.info(
             "%s: %d repaired, %d ambiguous, %d unresolved (of %d rows).",
@@ -468,6 +526,53 @@ class NivelArenaScraper:
             len(rows),
         )
         return repaired, ambiguous, unresolved
+
+    def import_sqlite_history(self, sqlite_path, dry_run=True):
+        """Copy scrape history out of a pre-PostgreSQL ``scraper.db``.
+
+        Versions before 2.0.0 tracked progress in SQLite. Without this the
+        switch to PostgreSQL looks like an empty history and the whole board
+        gets re-downloaded, which the target site does not deserve.
+
+        Rows already present in PostgreSQL are left as they are.
+        """
+        sqlite_path = Path(sqlite_path)
+        if not sqlite_path.exists():
+            raise FileNotFoundError(f"No SQLite database at {sqlite_path}")
+
+        # Read-only URI: this is a legacy file being retired, never written to.
+        legacy = sqlite3.connect(f"file:{quote(str(sqlite_path))}?mode=ro", uri=True)
+        try:
+            rows = legacy.execute("SELECT wr_id, card_id, image_filename FROM scraped_cards").fetchall()
+        finally:
+            legacy.close()
+
+        if not rows:
+            log.info("Nothing to import: %s has no rows.", sqlite_path)
+            return 0
+
+        if dry_run:
+            existing = {
+                wr_id
+                for (wr_id,) in self._conn.execute(
+                    "SELECT wr_id FROM scraped_cards WHERE wr_id = ANY(%s)",
+                    ([str(wr_id) for wr_id, _, _ in rows],),
+                ).fetchall()
+            }
+            new = sum(1 for wr_id, _, _ in rows if str(wr_id) not in existing)
+            log.info("Dry run: %d of %d rows from %s would be imported.", new, len(rows), sqlite_path)
+            return new
+
+        with self._conn.transaction(), self._conn.cursor() as cursor:
+            cursor.executemany(
+                "INSERT INTO scraped_cards (wr_id, card_id, image_filename) VALUES (%s, %s, %s)"
+                " ON CONFLICT (wr_id) DO NOTHING",
+                [(str(wr_id), card_id, image_filename) for wr_id, card_id, image_filename in rows],
+            )
+            imported = cursor.rowcount
+
+        log.info("Imported %d of %d rows from %s.", imported, len(rows), sqlite_path)
+        return imported
 
 
 def _env_float(name, default):
@@ -518,9 +623,14 @@ def build_arg_parser():
         help="Repoint DB rows at their real on-disk filenames, then exit.",
     )
     parser.add_argument(
+        "--import-sqlite",
+        metavar="PATH",
+        help="Import scrape history from a pre-PostgreSQL scraper.db, then exit.",
+    )
+    parser.add_argument(
         "--apply",
         action="store_true",
-        help="With --repair-filenames, write the changes instead of previewing.",
+        help="With --repair-filenames or --import-sqlite, write the changes instead of previewing.",
     )
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging.")
     return parser
@@ -534,15 +644,36 @@ def main(argv=None):
     if args.min_delay > args.max_delay:
         build_arg_parser().error("--min-delay must not exceed --max-delay")
 
-    with NivelArenaScraper(
-        args.base_url,
-        args.board_id,
-        min_delay=args.min_delay,
-        max_delay=args.max_delay,
-        obey_robots=not args.ignore_robots and not args.repair_filenames,
-    ) as scraper:
+    # Maintenance modes never touch the network, so they never need robots.txt.
+    maintenance = args.repair_filenames or args.import_sqlite
+
+    try:
+        scraper = NivelArenaScraper(
+            args.base_url,
+            args.board_id,
+            min_delay=args.min_delay,
+            max_delay=args.max_delay,
+            obey_robots=not args.ignore_robots and not maintenance,
+        )
+    except DatabaseNotConfigured as exc:
+        log.error("%s", exc)
+        return 2
+    except psycopg.OperationalError as exc:
+        # The URL is in the exception text on some failures; keep it out of logs.
+        log.error("Could not connect to PostgreSQL: %s", str(exc).strip().splitlines()[0])
+        return 2
+
+    with scraper:
         if args.repair_filenames:
             scraper.repair_filenames(dry_run=not args.apply)
+            return 0
+
+        if args.import_sqlite:
+            try:
+                scraper.import_sqlite_history(args.import_sqlite, dry_run=not args.apply)
+            except (FileNotFoundError, sqlite3.Error) as exc:
+                log.error("Import failed: %s", exc)
+                return 1
             return 0
 
         try:

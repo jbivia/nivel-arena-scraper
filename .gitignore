@@ -10,6 +10,9 @@ venv/
 .pytest_cache/
 .ruff_cache/
 
+# Secrets
+.env
+
 # Project specific
 .gemini/
 data/

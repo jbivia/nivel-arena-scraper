@@ -1,24 +1,25 @@
 """Tests for the scraper's database, download and board-walking behaviour."""
 
 import io
+import sqlite3
 
 import pytest
 import requests
 
 import main
-from main import MAX_IMAGE_BYTES, NivelArenaScraper
+from main import MAX_IMAGE_BYTES, DatabaseNotConfigured, NivelArenaScraper
 
 JPEG_BODY = b"\xff\xd8\xff\xe0" + b"\x00" * 512
 
 
 @pytest.fixture
-def scraper(tmp_path, monkeypatch):
+def scraper(tmp_path, monkeypatch, database_url):
     # No sleeping and no robots fetch in tests.
     monkeypatch.setattr(main.time, "sleep", lambda _: None)
     with NivelArenaScraper(
         "http://example.test",
         "cardlists",
-        db_path=tmp_path / "data" / "test.db",
+        database_url=database_url,
         downloads_dir=tmp_path / "downloads",
         obey_robots=False,
     ) as instance:
@@ -61,6 +62,31 @@ def stub_get(scraper, response):
     scraper.session.get = lambda *a, **kw: response
 
 
+class TestConnectionConfig:
+    """These need no database: they cover the paths taken before one is opened."""
+
+    def test_missing_url_is_a_clear_error(self, tmp_path, monkeypatch):
+        monkeypatch.delenv(main.DATABASE_URL_ENV, raising=False)
+        with pytest.raises(DatabaseNotConfigured, match=main.DATABASE_URL_ENV):
+            NivelArenaScraper("http://example.test", "cardlists", downloads_dir=tmp_path / "downloads")
+
+    @pytest.mark.parametrize(
+        ("url", "expected"),
+        [
+            ("postgres://nivel:hunter2@nivel-db:5432/nivel", "postgres://nivel:***@nivel-db:5432/nivel"),
+            ("postgres://nivel@nivel-db:5432/nivel", "postgres://nivel@nivel-db:5432/nivel"),
+            ("postgres://nivel-db/nivel", "postgres://nivel-db/nivel"),
+        ],
+    )
+    def test_redacts_password_for_logging(self, url, expected):
+        assert main.redact_conninfo(url) == expected
+
+    def test_redaction_drops_query_and_fragment(self):
+        # sslmode etc. are harmless, but a stray password= there would not be.
+        redacted = main.redact_conninfo("postgres://u:p@h:5432/db?password=hunter2#frag")
+        assert "hunter2" not in redacted
+
+
 class TestDatabase:
     def test_round_trip(self, scraper):
         assert not scraper.is_already_scraped("1")
@@ -73,9 +99,51 @@ class TestDatabase:
         rows = scraper._conn.execute("SELECT image_filename FROM scraped_cards").fetchall()
         assert rows == [("BT06-001.jpg",)]
 
-    def test_wal_mode_enabled(self, scraper):
-        mode = scraper._conn.execute("PRAGMA journal_mode").fetchone()[0]
-        assert mode.lower() == "wal"
+    def test_init_is_idempotent(self, scraper):
+        scraper.mark_as_scraped("1", "BT06-001", "BT06-001.jpg")
+        scraper._init_db()  # CREATE TABLE IF NOT EXISTS must not drop anything
+        assert scraper.is_already_scraped("1")
+
+    def test_rows_are_timestamped(self, scraper):
+        scraper.mark_as_scraped("1", "BT06-001", "BT06-001.jpg")
+        stamped = scraper._conn.execute(
+            "SELECT scraped_at IS NOT NULL FROM scraped_cards WHERE wr_id = '1'"
+        ).fetchone()[0]
+        assert stamped
+
+
+class TestImportSqliteHistory:
+    @staticmethod
+    def _legacy_db(path, rows):
+        conn = sqlite3.connect(path)
+        conn.execute("CREATE TABLE scraped_cards (wr_id TEXT PRIMARY KEY, card_id TEXT, image_filename TEXT)")
+        conn.executemany("INSERT INTO scraped_cards VALUES (?, ?, ?)", rows)
+        conn.commit()
+        conn.close()
+        return path
+
+    def test_imports_rows(self, scraper, tmp_path):
+        legacy = self._legacy_db(tmp_path / "old.db", [("1", "BT06-001", "BT06-001.jpg")])
+        assert scraper.import_sqlite_history(legacy, dry_run=False) == 1
+        assert scraper.is_already_scraped("1")
+
+    def test_dry_run_writes_nothing(self, scraper, tmp_path):
+        legacy = self._legacy_db(tmp_path / "old.db", [("1", "BT06-001", "BT06-001.jpg")])
+        assert scraper.import_sqlite_history(legacy, dry_run=True) == 1
+        assert not scraper.is_already_scraped("1")
+
+    def test_existing_rows_are_left_alone(self, scraper, tmp_path):
+        scraper.mark_as_scraped("1", "BT06-001", "BT06-001-01.jpg")
+        legacy = self._legacy_db(tmp_path / "old.db", [("1", "BT06-001", "BT06-001.jpg")])
+
+        assert scraper.import_sqlite_history(legacy, dry_run=False) == 0
+
+        row = scraper._conn.execute("SELECT image_filename FROM scraped_cards WHERE wr_id = '1'").fetchone()
+        assert row[0] == "BT06-001-01.jpg"
+
+    def test_missing_file_raises(self, scraper, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            scraper.import_sqlite_history(tmp_path / "nope.db", dry_run=True)
 
 
 class TestDownloadImage:

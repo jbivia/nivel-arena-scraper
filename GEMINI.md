@@ -1,6 +1,6 @@
 # NivelArena Card Scraper
 
-A Python web scraper that extracts high-resolution trading card images from `nivelarena.co.kr` (a GnuBoard5-based site). Containerized, with a SQLite database tracking progress to prevent redundant downloads.
+A Python web scraper that extracts high-resolution trading card images from `nivelarena.co.kr` (a GnuBoard5-based site). Containerized, with a PostgreSQL database tracking progress to prevent redundant downloads.
 
 ## Project Overview
 
@@ -10,7 +10,10 @@ A Python web scraper that extracts high-resolution trading card images from `niv
   - **Requests**: HTTP requests and AJAX calls.
   - **BeautifulSoup4**: HTML parsing.
   - **OpenCV** (`opencv-python-headless`): Background removal.
-  - **SQLite3**: Tracks scraped cards via `wr_id`.
+  - **PostgreSQL** (via `psycopg` 3): Tracks scraped cards via `wr_id`, in a `scraped_cards`
+    table the scraper creates itself. The server is the one from the sibling
+    `nivel-arena-collection-tracker` stack (container `nivel-db`, database `nivel`);
+    `compose.yaml` joins that stack's external network instead of declaring its own database.
   - **Podman/Docker Compose**: Containerized execution.
 - **Architecture**:
   - The scraper iterates through the board's pagination (`/bbs/board.php?bo_table=…&page=N`).
@@ -32,7 +35,8 @@ A Python web scraper that extracts high-resolution trading card images from `niv
 | `make convert` | Convert downloaded JPGs to transparent PNGs |
 | `make down` | Stop the scraper |
 | `make logs` | Follow container logs |
-| `make purge-db` | Reset scraping history |
+| `make purge-db` | Reset scraping history (needs `CONFIRM=yes`) |
+| `make import-sqlite` | Import history from the pre-2.0.0 `data/scraper.db` |
 | `make help` | List all targets |
 
 ### Manual quick start
@@ -40,7 +44,8 @@ A Python web scraper that extracts high-resolution trading card images from `niv
 Without `make`:
 
 ```bash
-mkdir -p downloads processed data
+mkdir -p downloads processed
+cp .env.example .env    # then set SCRAPER_DATABASE_URL
 podman compose up --build          # scrape
 podman compose run --rm scraper python convert_to_png.py   # convert
 podman compose down
@@ -50,7 +55,7 @@ Or run directly on the host:
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-SCRAPER_DB_PATH=data/scraper.db \
+SCRAPER_DATABASE_URL=postgres://nivel:...@localhost:5432/nivel \
 SCRAPER_DOWNLOADS_DIR=downloads \
 SCRAPER_PROCESSED_DIR=processed \
   .venv/bin/python main.py --max-pages 1
@@ -59,11 +64,12 @@ SCRAPER_PROCESSED_DIR=processed \
 ## Development
 
 ```bash
-make venv   # create .venv with dev dependencies
-make check  # lint + tests + dependency CVE audit
+make venv        # create .venv with dev dependencies
+make test-db-up  # throwaway PostgreSQL for the DB tests, on port 55432
+make check       # lint + tests + dependency CVE audit
 ```
 
-Tests live in `tests/` and import `main` / `convert_to_png` directly (`pythonpath = ["."]` in `pyproject.toml`). The OpenCV tests skip automatically if `cv2` is not installed.
+Tests live in `tests/` and import `main` / `convert_to_png` directly (`pythonpath = ["."]` in `pyproject.toml`). The OpenCV tests skip automatically if `cv2` is not installed; the database tests skip unless `SCRAPER_TEST_DATABASE_URL` points at a reachable PostgreSQL, and each one runs in its own throwaway schema.
 
 ## Configuration
 
@@ -72,7 +78,8 @@ All settings are CLI flags or environment variables — nothing requires editing
 ## Development Conventions
 
 - **Security**: The target site is HTTP-only, so all responses are treated as untrusted: size caps, content-type and magic-byte validation, cross-host redirect refusal, and filename sanitization. The container runs as non-root with a read-only rootfs and all capabilities dropped.
-- **Persistence**: Images in `./downloads`, PNGs in `./processed`, history in `./data/scraper.db` (WAL mode).
+- **Persistence**: Images in `./downloads`, PNGs in `./processed`, history in the `scraped_cards` PostgreSQL table. The connection is autocommit so a long scrape never holds an idle transaction open against a database the tracker app shares; `repair_filenames` and the SQLite import open explicit transactions.
+- **Credentials**: `SCRAPER_DATABASE_URL` is environment-only and deliberately has no CLI flag (`argv` is world-readable via `/proc`). It comes from `.env`, which is gitignored; `redact_conninfo()` strips the password before anything is logged.
 - **Error Handling**: All HTTP calls carry timeouts; transient errors (429, 5xx) retry with exponential backoff; a run survives isolated page failures and gives up after `MAX_CONSECUTIVE_PAGE_FAILURES`.
 - **Resource Management**: `NivelArenaScraper` is a context manager, closing both the DB connection and the HTTP session.
 - **Atomicity**: Downloads stream to a `.part` file and are renamed only on success.

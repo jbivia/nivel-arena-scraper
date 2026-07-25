@@ -26,8 +26,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py convert_to_png.py ./
 
 # Only the mounted data directories are writable by the runtime user.
-RUN mkdir -p /app/downloads /app/processed /app/data \
-    && chown -R scraperuser:scraperuser /app/downloads /app/processed /app/data
+# Scrape state lives in PostgreSQL, so there is no database file to host here.
+RUN mkdir -p /app/downloads /app/processed \
+    && chown -R scraperuser:scraperuser /app/downloads /app/processed
 
 USER scraperuser
 
