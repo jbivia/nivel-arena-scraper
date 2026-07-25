@@ -5,6 +5,7 @@ A containerized Python scraper that collects high-resolution trading card images
 ## Features
 
 - **Automated scraping**: Walks the board's pagination, resolves each card through the site's AJAX detail endpoint, and downloads the full-resolution image.
+- **Card metadata**: The same detail response carries every printed field — cost, power, hit, rarity, effect, element, affiliation, keywords — which is parsed into a `cards` catalogue table. No OCR; see [RULES.md](RULES.md).
 - **Duplicate prevention**: A PostgreSQL table keyed on `wr_id` means re-runs only fetch what is new.
 - **Respectful crawling**: Randomized delays, `robots.txt` compliance, and automatic backoff on `429`/`5xx`.
 - **Hardened downloads**: Size caps, content-type and magic-byte checks, cross-host redirect refusal, and atomic writes.
@@ -15,7 +16,9 @@ A containerized Python scraper that collects high-resolution trading card images
 
 ```text
 ├── main.py                 # Scraper (Requests + BeautifulSoup)
+├── card_metadata.py        # Detail-response parser (no I/O)
 ├── convert_to_png.py       # Image processing (OpenCV)
+├── RULES.md                # Card layout and metadata field reference
 ├── tests/                  # Test suite
 ├── compose.yaml            # Container orchestration
 ├── Containerfile           # Container image definition
@@ -36,14 +39,49 @@ A containerized Python scraper that collects high-resolution trading card images
 
 ## Database
 
-Scrape progress lives in PostgreSQL, in a `scraped_cards` table the scraper creates itself on first run:
+Two tables are involved, with different owners.
+
+`scraped_cards` belongs to the scraper, which creates it on first run, and tracks what has been downloaded:
 
 | Column | Type | Purpose |
 | --- | --- | --- |
 | `wr_id` | `TEXT PRIMARY KEY` | GnuBoard write-ID; the deduplication key |
-| `card_id` | `TEXT` | Sanitized card name, also the filename stem |
+| `card_id` | `TEXT` | Sanitized card number, also the filename stem |
 | `image_filename` | `TEXT` | Name the image was actually saved under |
 | `scraped_at` | `TIMESTAMPTZ` | Insertion time, defaulted by the server |
+
+`cards` is the catalogue **the tracker app owns**. Its shape comes from that app's drizzle
+migrations; the scraper only fills it, upserting on `wr_id`, and never creates or alters it. Run
+`make db-migrate` in [nivel-arena-collection-tracker](../nivel-arena-collection-tracker) before the
+first scrape — otherwise the scraper stops at startup and says so.
+
+| Column | Type | Purpose |
+| --- | --- | --- |
+| `id` | `SERIAL PRIMARY KEY` | The app's key; the collection references it |
+| `wr_id` | `TEXT UNIQUE` | GnuBoard write-ID — what the scraper upserts on |
+| `number` | `TEXT` | Printed number, `ST08-014`. **Not unique** — see below |
+| `set_code` | `TEXT` | Prefix of the number, `ST08` |
+| `name` | `TEXT` | Card name, as printed |
+| `type` / `type_en` | `TEXT` | 유닛 / 스킬 / 아이템 / 리더, plus its English form |
+| `element` / `element_en` | `TEXT` | 화염 / 번개 / 폭풍 / 파도 / 대지, plus its English form |
+| `cost`, `power`, `hit` | `INTEGER` | `NULL` where the card prints `-` |
+| `rarity` | `TEXT` | `C`, `R`, `SR`, `UR`, `SPR`, `SBR`, `L`, `P`, … |
+| `affiliation` | `TEXT[]` | `{이펙트,레기온}` |
+| `keywords` | `TEXT[]` | `{패시브,액티브}` |
+| `effect` | `TEXT` | Effect text, icons kept as `[패시브]` markers |
+| `trigger_text` | `TEXT` | The trigger box, stored separately |
+| `product_name`, `ip` | `TEXT` | Release pack and franchise |
+| `image_filename` | `TEXT` | The file in `downloads/` |
+| `updated_at` | `TIMESTAMPTZ` | Last refresh; a re-scrape updates the row |
+
+`number` is deliberately not unique: the same card is reprinted at several rarities (`BT05-071`
+exists as both UR and SPR), and each printing is its own board entry with its own image. The board
+also covers several franchises, so filter on `ip` — `승리의 여신: 니케` for NIKKE.
+
+`make purge-db` clears only `scraped_cards`. It leaves `cards` alone on purpose: the app's
+`collection_entries` cascade off it, so truncating the catalogue would delete the collection with it.
+
+The field-by-field mapping from the printed card face is in [RULES.md](RULES.md).
 
 The instance itself belongs to the sibling [nivel-arena-collection-tracker](../nivel-arena-collection-tracker) stack (container `nivel-db`, database `nivel`). Start it there before scraping; `compose.yaml` joins that stack's network rather than declaring a database of its own, which is what makes the `nivel-db` hostname resolve. The scraper's table sits alongside the tracker's drizzle-managed tables and is never touched by its migrations.
 
@@ -84,6 +122,22 @@ Nothing needs to be edited in source. Every setting is available as a CLI flag o
 The container reaches the database as `nivel-db:5432`; host-side tooling reaches the same server as `localhost:5432`. `.env.example` carries both, and the `make repair-db` / `make import-sqlite` recipes prefer `SCRAPER_DATABASE_URL_LOCAL` when it is set.
 
 Both scripts support `--help`. `main.py` also accepts `--ignore-robots` and `--verbose`; `convert_to_png.py` accepts `--workers`, `--force`, `--downloads-dir` and `--processed-dir`.
+
+### Backfilling metadata
+
+Cards downloaded before the catalogue existed have a `scraped_cards` row but no `cards` row. The
+backfill re-hits the detail endpoint for exactly those, at the usual crawl delays, and **never
+re-downloads an image**:
+
+```bash
+make backfill-metadata        # preview: reports how many rows would be filled, makes no requests
+make backfill-metadata-apply  # fetch and store
+make backfill-metadata-apply ARGS="--backfill-limit 5"   # or just the first few
+```
+
+It is resumable — the connection is autocommit, so an interrupted run keeps what it stored and the
+next one continues where it stopped. Add `--force` to refresh rows that already have metadata, which
+is what to run after adding a missing value to `card_metadata.CARD_TYPE_EN` or `ELEMENT_EN`.
 
 ## Development
 
