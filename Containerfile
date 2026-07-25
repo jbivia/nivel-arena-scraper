@@ -1,31 +1,35 @@
-# Use lightweight Debian slim for OpenCV compatibility
-FROM python:3.13-slim
+# Debian slim keeps OpenCV's shared-library dependencies simple.
+# Pin the patch version so rebuilds are reproducible; bump deliberately.
+FROM python:3.13.14-slim
 
-# Add a non-root user
-RUN adduser --disabled-password --gecos "" scraperuser
+# Fail fast, log immediately, and keep no bytecode cache in the image.
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# Set working directory
+RUN adduser --disabled-password --gecos "" --uid 1000 scraperuser
+
 WORKDIR /app
 
-# Install system dependencies for OpenCV
+# Runtime shared libraries required by opencv-python-headless.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 \
-    libgl1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install dependencies
+# Dependencies first so the layer caches across code edits.
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
-COPY main.py .
-COPY convert_to_png.py .
+# Application code stays owned by root: the unprivileged runtime user can read
+# and execute it but cannot modify it.
+COPY main.py convert_to_png.py ./
 
-# Create downloads, processed and data directories and adjust permissions
-RUN mkdir -p /app/downloads /app/processed /app/data && chown -R scraperuser:scraperuser /app/downloads /app/processed /app/data
+# Only the mounted data directories are writable by the runtime user.
+# Scrape state lives in PostgreSQL, so there is no database file to host here.
+RUN mkdir -p /app/downloads /app/processed \
+    && chown -R scraperuser:scraperuser /app/downloads /app/processed
 
-# Switch to non-root user
 USER scraperuser
 
-# Command to run the application
 CMD ["python", "main.py"]

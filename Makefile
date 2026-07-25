@@ -1,16 +1,36 @@
 # Variables
 COMPOSE = podman compose
-DATA_DIR = data
-DB_FILE = $(DATA_DIR)/scraper.db
+PYTHON = python3
+VENV = .venv
 
-.PHONY: help setup build up down logs purge-db purge-images shell
+# Throwaway PostgreSQL for the test suite, off the default port so it cannot
+# collide with the real nivel-db on 5432.
+TEST_DB_NAME = nivel-scraper-test-db
+TEST_DB_PORT = 55432
+TEST_DATABASE_URL = postgres://postgres:postgres@localhost:$(TEST_DB_PORT)/postgres
+
+# Recipes that talk to PostgreSQL read the credentials from .env rather than
+# taking them on the command line, where they would show up in `ps`.
+LOAD_ENV = set -a; . ./.env; set +a;
+
+# `nivel-db` only resolves inside the container network, so host-side recipes
+# prefer SCRAPER_DATABASE_URL_LOCAL (localhost) when .env defines one.
+LOAD_ENV_HOST = $(LOAD_ENV) export SCRAPER_DATABASE_URL="$${SCRAPER_DATABASE_URL_LOCAL:-$$SCRAPER_DATABASE_URL}";
+
+.PHONY: help setup build up up-d convert down logs shell \
+        venv test test-db-up test-db-down lint fmt audit check \
+        repair-db repair-db-apply import-sqlite import-sqlite-apply \
+        purge-db purge-downloads
 
 help: ## Show this help message
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
-setup: ## Initialize host directories and permissions
-	mkdir -p downloads processed data
-	chmod 755 downloads processed data
+setup: ## Initialize host directories and the .env file
+	mkdir -p downloads processed
+	chmod 755 downloads processed
+	@test -f .env || { cp .env.example .env; echo "Created .env -- set SCRAPER_DATABASE_URL before running."; }
+
+# --- container ---------------------------------------------------------------
 
 build: ## Build the scraper image
 	$(COMPOSE) build
@@ -30,15 +50,67 @@ down: ## Stop and remove containers
 logs: ## Follow container logs
 	$(COMPOSE) logs -f
 
-purge-db: ## Purge the SQLite database
-	@echo "Warning: This will delete the scraping history."
-	rm -f $(DB_FILE)
-	@echo "Database purged."
+shell: ## Open a shell inside the running container
+	$(COMPOSE) exec scraper /bin/sh
+
+# --- development -------------------------------------------------------------
+
+venv: ## Create a local virtualenv with dev dependencies
+	$(PYTHON) -m venv $(VENV)
+	$(VENV)/bin/pip install -q -r requirements-dev.txt
+
+test: ## Run the test suite (DB tests skip unless SCRAPER_TEST_DATABASE_URL is set)
+	$(VENV)/bin/pytest
+
+test-db-up: ## Start a throwaway PostgreSQL for the test suite
+	podman run -d --rm --name $(TEST_DB_NAME) \
+		-e POSTGRES_PASSWORD=postgres \
+		-p $(TEST_DB_PORT):5432 \
+		docker.io/library/postgres:18-alpine
+	@until podman exec $(TEST_DB_NAME) pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
+	@echo "Ready. Run: SCRAPER_TEST_DATABASE_URL=$(TEST_DATABASE_URL) make test"
+
+test-db-down: ## Stop the throwaway test PostgreSQL
+	-podman stop $(TEST_DB_NAME)
+
+lint: ## Check formatting and lint rules
+	$(VENV)/bin/ruff check .
+	$(VENV)/bin/ruff format --check .
+
+fmt: ## Auto-format and auto-fix
+	$(VENV)/bin/ruff format .
+	$(VENV)/bin/ruff check --fix .
+
+audit: ## Scan dependencies for known vulnerabilities
+	$(VENV)/bin/pip-audit -r requirements.txt
+
+check: lint test audit ## Run the full local verification suite
+
+# --- maintenance -------------------------------------------------------------
+
+repair-db: ## Preview repointing DB rows at their real filenames
+	@$(LOAD_ENV_HOST) SCRAPER_DOWNLOADS_DIR=downloads $(VENV)/bin/python main.py --repair-filenames
+
+repair-db-apply: ## Apply the DB filename repair
+	@$(LOAD_ENV_HOST) SCRAPER_DOWNLOADS_DIR=downloads $(VENV)/bin/python main.py --repair-filenames --apply
+
+import-sqlite: ## Preview importing history from the pre-PostgreSQL data/scraper.db
+	@$(LOAD_ENV_HOST) SCRAPER_DOWNLOADS_DIR=downloads \
+		$(VENV)/bin/python main.py --import-sqlite data/scraper.db
+
+import-sqlite-apply: ## Import history from the pre-PostgreSQL data/scraper.db
+	@$(LOAD_ENV_HOST) SCRAPER_DOWNLOADS_DIR=downloads \
+		$(VENV)/bin/python main.py --import-sqlite data/scraper.db --apply
+
+purge-db: ## Delete the scraping history (requires CONFIRM=yes)
+	@test "$(CONFIRM)" = "yes" || { \
+		echo "This truncates scraped_cards in the shared nivel database."; \
+		echo "Re-run with: make purge-db CONFIRM=yes"; exit 1; }
+	@$(LOAD_ENV) podman exec -i nivel-db psql "$$SCRAPER_DATABASE_URL" \
+		-c "TRUNCATE scraped_cards"
+	@echo "Scraping history purged."
 
 purge-downloads: ## Delete all downloaded images
 	@echo "Warning: This will delete all downloaded images."
 	rm -rf downloads/*
 	@echo "Downloads purged."
-
-shell: ## Open a shell inside the running container
-	$(COMPOSE) exec scraper /bin/sh

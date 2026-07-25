@@ -1,18 +1,60 @@
+"""Scrape trading card images from a GnuBoard5 card board.
+
+The target site is served over plaintext HTTP only (it has no TLS listener), so
+every response has to be treated as untrusted input: sizes are capped, content
+types are checked, and cross-host redirects are refused.
+
+Scrape progress is tracked in PostgreSQL. The connection string is read from
+``SCRAPER_DATABASE_URL`` and is deliberately not exposed as a CLI flag: argv is
+world-readable in ``/proc``, and the URL carries the password.
+"""
+
+import argparse
+import logging
 import os
-import time
 import random
+import re
 import sqlite3
+import time
+import unicodedata
+from pathlib import Path
+from urllib.parse import quote, urlparse, urlunparse
+from urllib.robotparser import RobotFileParser
+
+import psycopg
 import requests
+from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from bs4 import BeautifulSoup
-import logging
-from urllib.parse import urljoin
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+log = logging.getLogger("scraper")
 
-# REF-5: Default retry strategy for transient HTTP errors
+# The site's JavaScript encodes card links as "{image_filename}♬{wr_id}".
+# U+266C (beamed sixteenth notes) is the custom delimiter between the image
+# file on disk and the GnuBoard5 write-ID used by the AJAX detail endpoint.
+HREF_DELIMITER = "♬"
+
+# (connect, read) timeouts. Without these a half-open socket hangs the run
+# forever -- urllib3's Retry only covers responses, never a stalled read.
+REQUEST_TIMEOUT = (10, 30)
+
+# Hard ceiling on a single download. The largest observed card is ~200 KB;
+# 32 MB leaves generous headroom while bounding a hostile/broken response.
+MAX_IMAGE_BYTES = 32 * 1024 * 1024
+DOWNLOAD_CHUNK_SIZE = 65536
+
+# JPEG SOI marker. Guards against an HTML error page served with a 200.
+JPEG_MAGIC = b"\xff\xd8\xff"
+
+# Longest filename stem we will write, in UTF-8 bytes (ext4 caps names at 255).
+MAX_STEM_BYTES = 100
+
+# Anything outside this set is dropped from a card ID before it becomes a
+# filename. \w is Unicode-aware, so Korean card names survive, while path
+# separators, dots and control characters cannot.
+_UNSAFE_NAME_CHARS = re.compile(r"[^\w-]", re.UNICODE)
+
 DEFAULT_RETRY = Retry(
     total=3,
     backoff_factor=2,
@@ -20,39 +62,154 @@ DEFAULT_RETRY = Retry(
     allowed_methods=["GET", "POST"],
 )
 
+# Give up on a board after this many consecutive page failures rather than
+# aborting the whole run on the first transient error.
+MAX_CONSECUTIVE_PAGE_FAILURES = 3
+
+# Environment variable holding the libpq connection URL, e.g.
+# postgres://user:password@nivel-db:5432/nivel
+DATABASE_URL_ENV = "SCRAPER_DATABASE_URL"
+
+# Seconds to wait for the PostgreSQL TCP connect. Without it a wedged host
+# leaves the scraper hanging on startup indefinitely.
+DB_CONNECT_TIMEOUT = 10
+
+# Shows up in pg_stat_activity, so a long-running scrape is identifiable from
+# the tracker's side of the same database.
+DB_APPLICATION_NAME = "nivel-arena-scraper"
+
+
+def redact_conninfo(url):
+    """Return ``url`` with any password replaced, safe to log.
+
+    Anything unparseable is reduced to a placeholder rather than echoed: a
+    malformed URL is exactly the case where the password might land in a
+    surprising position.
+    """
+    try:
+        parts = urlparse(url)
+    except ValueError:
+        return "<unparseable connection string>"
+
+    if not parts.hostname:
+        return "<connection string>"
+
+    netloc = parts.hostname
+    if parts.port:
+        netloc = f"{netloc}:{parts.port}"
+    if parts.username:
+        netloc = f"{parts.username}:***@{netloc}" if parts.password else f"{parts.username}@{netloc}"
+
+    return urlunparse((parts.scheme, netloc, parts.path, "", "", ""))
+
+
+def safe_stem(raw, fallback):
+    """Turn scraped text into a filename stem that cannot escape its directory.
+
+    Returns ``fallback`` when nothing usable survives sanitisation.
+    """
+    normalised = unicodedata.normalize("NFKC", raw or "")
+    cleaned = _UNSAFE_NAME_CHARS.sub("", normalised).strip("-_")
+
+    # Truncate on a byte boundary so multi-byte names stay valid UTF-8.
+    encoded = cleaned.encode("utf-8")[:MAX_STEM_BYTES]
+    cleaned = encoded.decode("utf-8", errors="ignore").strip("-_")
+
+    return cleaned or fallback
+
+
+def parse_card_link(href):
+    """Split a board link into ``(image_filename, wr_id)``.
+
+    Returns ``None`` when the href is not a well-formed card link. The image
+    filename is validated as a bare name so it cannot walk the remote path.
+    """
+    if not href or HREF_DELIMITER not in href:
+        return None
+
+    parts = href.split(HREF_DELIMITER)
+    if len(parts) != 2:
+        return None
+
+    img_filename, wr_id = parts[0].strip(), parts[1].strip()
+    if not img_filename or not wr_id:
+        return None
+
+    # wr_id goes into a POST body and a DB key; the board only ever emits digits.
+    if not wr_id.isdigit():
+        return None
+
+    # Reject anything that is not a plain filename before it reaches a URL.
+    if "/" in img_filename or "\\" in img_filename or img_filename.startswith("."):
+        return None
+
+    return img_filename, wr_id
+
+
+class DatabaseNotConfigured(RuntimeError):
+    """Raised when no PostgreSQL connection string is available."""
+
 
 class NivelArenaScraper:
-    def __init__(self, base_url, board_id, db_path=None, downloads_dir=None):
-        self.base_url = base_url
+    def __init__(
+        self,
+        base_url,
+        board_id,
+        database_url=None,
+        downloads_dir=None,
+        min_delay=5.0,
+        max_delay=10.0,
+        obey_robots=True,
+        user_agent=None,
+    ):
+        self.base_url = base_url.rstrip("/")
         self.board_id = board_id
         self.ajax_url = f"{self.base_url}/skin/board/card_list_new/get_info.php"
+        self.base_host = urlparse(self.base_url).netloc
+        self.min_delay = min_delay
+        self.max_delay = max_delay
 
-        # REF-2: Use environment variables with sensible container/local fallbacks
-        self.db_path = db_path or os.environ.get("SCRAPER_DB_PATH", "/app/data/scraper.db")
-        self.downloads_dir = downloads_dir or os.environ.get("SCRAPER_DOWNLOADS_DIR", "/app/downloads")
+        self.database_url = database_url or os.environ.get(DATABASE_URL_ENV, "")
+        if not self.database_url:
+            raise DatabaseNotConfigured(
+                f"No PostgreSQL connection configured -- set {DATABASE_URL_ENV}, e.g. "
+                f"{DATABASE_URL_ENV}=postgres://user:password@nivel-db:5432/nivel"
+            )
 
-        # Ensure directories exist
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-        os.makedirs(self.downloads_dir, exist_ok=True)
+        self.downloads_dir = Path(downloads_dir or os.environ.get("SCRAPER_DOWNLOADS_DIR", "/app/downloads"))
+        self.downloads_dir.mkdir(parents=True, exist_ok=True)
 
-        # OPT-1: Persistent DB connection instead of opening one per query
-        self._conn = sqlite3.connect(self.db_path)
+        self._conn = psycopg.connect(
+            self.database_url,
+            connect_timeout=DB_CONNECT_TIMEOUT,
+            application_name=DB_APPLICATION_NAME,
+        )
+        # Autocommit keeps a long scrape from holding an idle transaction open
+        # against a database the tracker app is also using; the one multi-row
+        # operation (repair_filenames) opens an explicit transaction instead.
+        self._conn.autocommit = True
         self._init_db()
 
-        # REF-5: Session with automatic retry on transient errors
         self.session = requests.Session()
         adapter = HTTPAdapter(max_retries=DEFAULT_RETRY)
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
+        self.session.headers.update(
+            {
+                "User-Agent": user_agent
+                or os.environ.get(
+                    "SCRAPER_USER_AGENT",
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
+                ),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                "image/avif,image/webp,*/*;q=0.8",
+                "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
+            }
+        )
 
-        # Simulate a legitimate browser
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5'
-        })
+        self._robots = self._load_robots() if obey_robots else None
 
-    # REF-7: Context manager support for clean resource lifecycle
     def __enter__(self):
         return self
 
@@ -69,168 +226,463 @@ class NivelArenaScraper:
             self.session.close()
             self.session = None
 
+    # --- robots -----------------------------------------------------------
+
+    def _load_robots(self):
+        """Fetch robots.txt. A missing file means 'no restrictions'."""
+        parser = RobotFileParser()
+        robots_url = f"{self.base_url}/robots.txt"
+        try:
+            response = self.session.get(robots_url, timeout=REQUEST_TIMEOUT)
+        except requests.RequestException as exc:
+            log.warning("Could not fetch %s (%s); proceeding without robots rules.", robots_url, exc)
+            return None
+
+        if response.status_code >= 400:
+            log.info(
+                "No robots.txt at %s (HTTP %s); no crawl restrictions.", robots_url, response.status_code
+            )
+            parser.parse([])
+        else:
+            parser.parse(response.text.splitlines())
+        return parser
+
+    def _may_fetch(self, url):
+        if self._robots is None:
+            return True
+        agent = self.session.headers.get("User-Agent", "*")
+        allowed = self._robots.can_fetch(agent, url)
+        if not allowed:
+            log.warning("robots.txt disallows %s -- skipping.", url)
+        return allowed
+
+    # --- database ---------------------------------------------------------
+
     def _init_db(self):
-        self._conn.execute("""
+        # The scraper owns this table outright; it lives alongside the tracker
+        # app's drizzle-managed tables but is never touched by its migrations.
+        self._conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS scraped_cards (
                 wr_id TEXT PRIMARY KEY,
                 card_id TEXT,
                 image_filename TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                scraped_at TIMESTAMPTZ NOT NULL DEFAULT now()
             )
-        """)
-        self._conn.commit()
-        logging.info("Database initialized.")
+            """
+        )
+        log.info("Database ready at %s", redact_conninfo(self.database_url))
 
     def is_already_scraped(self, wr_id):
-        cursor = self._conn.execute("SELECT 1 FROM scraped_cards WHERE wr_id = ?", (wr_id,))
+        cursor = self._conn.execute("SELECT 1 FROM scraped_cards WHERE wr_id = %s", (wr_id,))
         return cursor.fetchone() is not None
 
     def mark_as_scraped(self, wr_id, card_id, image_filename):
+        # DO NOTHING so a concurrent run cannot crash the scrape on a PK clash.
         self._conn.execute(
-            "INSERT INTO scraped_cards (wr_id, card_id, image_filename) VALUES (?, ?, ?)",
-            (wr_id, card_id, image_filename)
+            "INSERT INTO scraped_cards (wr_id, card_id, image_filename) VALUES (%s, %s, %s)"
+            " ON CONFLICT (wr_id) DO NOTHING",
+            (wr_id, card_id, image_filename),
         )
-        self._conn.commit()
+
+    # --- http -------------------------------------------------------------
 
     def get_html(self, url):
-        logging.info(f"Fetching List Page: {url}")
-        # Add a small delay between page requests as well
-        time.sleep(random.uniform(2, 5))
-        response = self.session.get(url)
+        log.info("Fetching list page: %s", url)
+        time.sleep(random.uniform(2, 5))  # noqa: S311 - politeness jitter, not a secret
+        response = self.session.get(url, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
-        return BeautifulSoup(response.text, 'html.parser')
-
-    def download_image(self, img_url, filename):
-        """Download an image and return the final saved filename, or None on failure."""
-        filepath = os.path.join(self.downloads_dir, filename)
-
-        # Handle duplicates if the file already exists
-        if os.path.exists(filepath):
-            name, ext = os.path.splitext(filename)
-            found_new_name = False
-            for i in range(1, 100):
-                new_filename = f"{name}-{i:02d}{ext}"
-                new_filepath = os.path.join(self.downloads_dir, new_filename)
-                if not os.path.exists(new_filepath):
-                    logging.info(f"Duplicate found. Saving {filename} as {new_filename}")
-                    filename = new_filename
-                    filepath = new_filepath
-                    found_new_name = True
-                    break
-
-            if not found_new_name:
-                logging.error(f"Could not find an available filename for {filename} after 99 attempts.")
-                return None
-
-        logging.info(f"Downloading image: {img_url} to {filename}")
-        response = self.session.get(img_url, stream=True)
-        response.raise_for_status()
-
-        # OPT-2: Use 64KB chunks instead of 8KB to reduce syscall overhead
-        with open(filepath, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=65536):
-                f.write(chunk)
-        time.sleep(1)  # Delay after download
-
-        # BUG-1: Return the actual saved filename so the caller can track it
-        return filename
+        return BeautifulSoup(response.text, "html.parser")
 
     def get_card_details(self, wr_id):
-        payload = {
-            'bo_table': self.board_id,
-            'wr_id': wr_id
-        }
-        # BUG-3: Pass AJAX headers directly to the request instead of mutating
-        # session state. Session-level headers (User-Agent, etc.) are merged
-        # automatically by requests.
+        payload = {"bo_table": self.board_id, "wr_id": wr_id}
+        # Per-request headers; session-level headers are merged automatically,
+        # so this never mutates shared session state.
         headers = {
-            'X-Requested-With': 'XMLHttpRequest',
-            'Referer': f'{self.base_url}/bbs/board.php?bo_table={self.board_id}'
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": f"{self.base_url}/bbs/board.php?bo_table={self.board_id}",
         }
 
-        logging.info(f"Fetching details for wr_id: {wr_id}")
-        response = self.session.post(self.ajax_url, data=payload, headers=headers)
+        log.info("Fetching details for wr_id %s", wr_id)
+        response = self.session.post(self.ajax_url, data=payload, headers=headers, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
-        return BeautifulSoup(response.text, 'html.parser')
+        return BeautifulSoup(response.text, "html.parser")
+
+    def _reserve_filename(self, filename):
+        """Return an unused path for ``filename``, suffixing -01..-99 on clash."""
+        filepath = self.downloads_dir / filename
+        if not filepath.exists():
+            return filepath
+
+        stem, ext = os.path.splitext(filename)
+        for i in range(1, 100):
+            candidate = self.downloads_dir / f"{stem}-{i:02d}{ext}"
+            if not candidate.exists():
+                log.info("Duplicate found. Saving %s as %s", filename, candidate.name)
+                return candidate
+
+        log.error("No available filename for %s after 99 attempts.", filename)
+        return None
+
+    def download_image(self, img_url, filename):
+        """Download an image and return the saved filename, or None on failure."""
+        if not self._may_fetch(img_url):
+            return None
+
+        filepath = self._reserve_filename(filename)
+        if filepath is None:
+            return None
+
+        log.info("Downloading %s -> %s", img_url, filepath.name)
+        # Redirects are followed, but the final host must still be the board's:
+        # over plaintext HTTP a hop can be injected, and we will not stream an
+        # unbounded body from wherever it points.
+        with self.session.get(
+            img_url, stream=True, timeout=REQUEST_TIMEOUT, allow_redirects=True
+        ) as response:
+            response.raise_for_status()
+
+            final_host = urlparse(response.url).netloc
+            if final_host != self.base_host:
+                log.error("Refusing cross-host redirect: %s -> %s", img_url, response.url)
+                return None
+
+            content_type = response.headers.get("Content-Type", "").split(";")[0].strip().lower()
+            if not content_type.startswith("image/"):
+                log.error("Refusing non-image response for %s (Content-Type: %r)", img_url, content_type)
+                return None
+
+            declared = response.headers.get("Content-Length")
+            if declared and declared.isdigit() and int(declared) > MAX_IMAGE_BYTES:
+                log.error(
+                    "Refusing %s: declared size %s exceeds %d bytes", img_url, declared, MAX_IMAGE_BYTES
+                )
+                return None
+
+            # Stream to a sibling .part file and rename only on success, so an
+            # interrupted download never leaves a truncated .jpg behind that a
+            # later run would mistake for a completed one.
+            tmp_path = filepath.with_name(filepath.name + ".part")
+            written = 0
+            try:
+                with open(tmp_path, "wb") as handle:
+                    for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
+                        if not chunk:
+                            continue
+                        if written == 0 and not chunk.startswith(JPEG_MAGIC):
+                            log.error("Refusing %s: payload is not a JPEG.", img_url)
+                            return None
+                        written += len(chunk)
+                        if written > MAX_IMAGE_BYTES:
+                            log.error("Refusing %s: body exceeded %d bytes.", img_url, MAX_IMAGE_BYTES)
+                            return None
+                        handle.write(chunk)
+
+                if written == 0:
+                    log.error("Refusing %s: empty response body.", img_url)
+                    return None
+
+                os.replace(tmp_path, filepath)
+            finally:
+                tmp_path.unlink(missing_ok=True)
+
+        time.sleep(1)
+        return filepath.name
+
+    # --- orchestration ----------------------------------------------------
 
     def scrape_board(self, max_pages=None):
         page = 1
+        consecutive_failures = 0
+
         while True:
             if max_pages is not None and page > max_pages:
                 break
 
             list_url = f"{self.base_url}/bbs/board.php?bo_table={self.board_id}&page={page}"
-            try:
-                soup = self.get_html(list_url)
-            except Exception as e:
-                logging.error(f"Failed to retrieve page {page}: {e}")
+            if not self._may_fetch(list_url):
                 break
 
-            # Find all card links
-            card_links = soup.select('div.gall_img a')
+            try:
+                soup = self.get_html(list_url)
+            except Exception as exc:
+                consecutive_failures += 1
+                log.error(
+                    "Failed to retrieve page %d (%d/%d consecutive failures): %s",
+                    page,
+                    consecutive_failures,
+                    MAX_CONSECUTIVE_PAGE_FAILURES,
+                    exc,
+                )
+                if consecutive_failures >= MAX_CONSECUTIVE_PAGE_FAILURES:
+                    log.error("Giving up after %d consecutive page failures.", consecutive_failures)
+                    break
+                page += 1
+                continue
 
+            consecutive_failures = 0
+            card_links = soup.select("div.gall_img a")
             if not card_links:
-                logging.warning(f"No more items found on page {page}.")
+                log.info("No more items found on page %d. Board complete.", page)
                 break
 
             for link in card_links:
-                href = link.get('href')
-                # REF-4: The site's JavaScript encodes card links as
-                # "{image_filename}♬{wr_id}" — the ♬ (musical note) character
-                # acts as a custom delimiter between the image file and the
-                # GnuBoard5 write-ID used by the AJAX detail endpoint.
-                if href and '♬' in href:
-                    parts = href.split('♬')
-                    if len(parts) == 2:
-                        img_filename = parts[0]
-                        wr_id = parts[1]
+                parsed = parse_card_link(link.get("href"))
+                if parsed is None:
+                    log.debug("Skipping unrecognised link: %r", link.get("href"))
+                    continue
 
-                        # Check DB before processing
-                        if self.is_already_scraped(wr_id):
-                            logging.info(f"Skipping wr_id {wr_id} - already scraped.")
-                            continue
+                img_filename, wr_id = parsed
+                if self.is_already_scraped(wr_id):
+                    log.info("Skipping wr_id %s - already scraped.", wr_id)
+                    continue
 
-                        self.scrape_card(wr_id, img_filename)
+                self.scrape_card(wr_id, img_filename)
 
-                        # Random delay between 5 to 10 seconds
-                        delay = random.uniform(5, 10)
-                        logging.info(f"Sleeping for {delay:.2f} seconds to respect rate limits...")
-                        time.sleep(delay)
+                delay = random.uniform(self.min_delay, self.max_delay)  # noqa: S311 - politeness jitter
+                log.info("Sleeping %.2fs to respect rate limits...", delay)
+                time.sleep(delay)
 
             page += 1
 
     def scrape_card(self, wr_id, img_filename):
         try:
             detail_soup = self.get_card_details(wr_id)
-        except Exception as e:
-            logging.error(f"Failed to retrieve details for wr_id {wr_id}: {e}")
+        except Exception as exc:
+            log.error("Failed to retrieve details for wr_id %s: %s", wr_id, exc)
             return
 
-        # 1. Extract Metadata for Filenaming
         card_id = f"unknown_{wr_id}"
-        type_header = detail_soup.select_one('#type')
+        type_header = detail_soup.select_one("#type")
         if type_header:
-            raw_text = type_header.get_text(strip=True)
-            card_id = raw_text.split('/')[0].strip()
-            # Clean up filename
-            card_id = "".join(c for c in card_id if c.isalnum() or c in ('-', '_')).rstrip()
+            raw_text = type_header.get_text(strip=True).split("/")[0]
+            card_id = safe_stem(raw_text, fallback=f"unknown_{wr_id}")
 
-        # 2. Construct High-Res Image URL directly from the list view data
-        full_src = f"{self.base_url}/data/file/{self.board_id}/{img_filename}"
-        save_filename = f"{card_id}.jpg"
+        # quote() keeps a hostile filename from injecting query/fragment parts
+        # into the URL; parse_card_link has already rejected path separators.
+        full_src = f"{self.base_url}/data/file/{self.board_id}/{quote(img_filename, safe='')}"
+
         try:
-            # BUG-2: Use the actual saved filename (which may have been
-            # deduplicated) when recording to the database.
-            actual_filename = self.download_image(full_src, save_filename)
-            if actual_filename:
-                self.mark_as_scraped(wr_id, card_id, actual_filename)
-        except Exception as e:
-            logging.error(f"Failed to download {full_src}: {e}")
+            actual_filename = self.download_image(full_src, f"{card_id}.jpg")
+        except Exception as exc:
+            log.error("Failed to download %s: %s", full_src, exc)
+            return
+
+        if actual_filename:
+            self.mark_as_scraped(wr_id, card_id, actual_filename)
+
+    # --- maintenance ------------------------------------------------------
+
+    def repair_filenames(self, dry_run=True):
+        """Repoint DB rows written before the saved-filename fix.
+
+        Early versions recorded the *source* filename instead of the name the
+        image was saved under, so those rows point at files that do not exist.
+        A row is only repaired when exactly one unclaimed file on disk matches
+        its card_id, so ambiguous variants are left alone.
+        """
+        rows = self._conn.execute("SELECT wr_id, card_id, image_filename FROM scraped_cards").fetchall()
+
+        on_disk = {p.name for p in self.downloads_dir.glob("*.jpg")}
+        claimed = {name for _, _, name in rows if name in on_disk}
+
+        repaired, ambiguous, unresolved = 0, 0, 0
+        updates = []
+        for wr_id, card_id, image_filename in rows:
+            if image_filename in on_disk:
+                continue
+
+            pattern = re.compile(rf"^{re.escape(card_id)}(-\d{{2}})?\.jpg$")
+            candidates = sorted(n for n in on_disk - claimed if pattern.match(n))
+
+            if len(candidates) == 1:
+                new_name = candidates[0]
+                log.info("Repair wr_id %s: %r -> %r", wr_id, image_filename, new_name)
+                updates.append((new_name, wr_id))
+                claimed.add(new_name)
+                repaired += 1
+            elif len(candidates) > 1:
+                log.warning("wr_id %s (%s): %d candidates, leaving alone.", wr_id, card_id, len(candidates))
+                ambiguous += 1
+            else:
+                log.warning("wr_id %s (%s): no matching file on disk.", wr_id, card_id)
+                unresolved += 1
+
+        # One transaction for the whole repair: a partially-applied rename pass
+        # is harder to reason about than one that either lands or does not.
+        if not dry_run and updates:
+            with self._conn.transaction(), self._conn.cursor() as cursor:
+                cursor.executemany(
+                    "UPDATE scraped_cards SET image_filename = %s WHERE wr_id = %s",
+                    updates,
+                )
+
+        log.info(
+            "%s: %d repaired, %d ambiguous, %d unresolved (of %d rows).",
+            "Dry run" if dry_run else "Repair complete",
+            repaired,
+            ambiguous,
+            unresolved,
+            len(rows),
+        )
+        return repaired, ambiguous, unresolved
+
+    def import_sqlite_history(self, sqlite_path, dry_run=True):
+        """Copy scrape history out of a pre-PostgreSQL ``scraper.db``.
+
+        Versions before 2.0.0 tracked progress in SQLite. Without this the
+        switch to PostgreSQL looks like an empty history and the whole board
+        gets re-downloaded, which the target site does not deserve.
+
+        Rows already present in PostgreSQL are left as they are.
+        """
+        sqlite_path = Path(sqlite_path)
+        if not sqlite_path.exists():
+            raise FileNotFoundError(f"No SQLite database at {sqlite_path}")
+
+        # Read-only URI: this is a legacy file being retired, never written to.
+        legacy = sqlite3.connect(f"file:{quote(str(sqlite_path))}?mode=ro", uri=True)
+        try:
+            rows = legacy.execute("SELECT wr_id, card_id, image_filename FROM scraped_cards").fetchall()
+        finally:
+            legacy.close()
+
+        if not rows:
+            log.info("Nothing to import: %s has no rows.", sqlite_path)
+            return 0
+
+        if dry_run:
+            existing = {
+                wr_id
+                for (wr_id,) in self._conn.execute(
+                    "SELECT wr_id FROM scraped_cards WHERE wr_id = ANY(%s)",
+                    ([str(wr_id) for wr_id, _, _ in rows],),
+                ).fetchall()
+            }
+            new = sum(1 for wr_id, _, _ in rows if str(wr_id) not in existing)
+            log.info("Dry run: %d of %d rows from %s would be imported.", new, len(rows), sqlite_path)
+            return new
+
+        with self._conn.transaction(), self._conn.cursor() as cursor:
+            cursor.executemany(
+                "INSERT INTO scraped_cards (wr_id, card_id, image_filename) VALUES (%s, %s, %s)"
+                " ON CONFLICT (wr_id) DO NOTHING",
+                [(str(wr_id), card_id, image_filename) for wr_id, card_id, image_filename in rows],
+            )
+            imported = cursor.rowcount
+
+        log.info("Imported %d of %d rows from %s.", imported, len(rows), sqlite_path)
+        return imported
+
+
+def _env_float(name, default):
+    try:
+        return float(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+
+
+def build_arg_parser():
+    parser = argparse.ArgumentParser(description="Scrape trading card images from a GnuBoard5 board.")
+    parser.add_argument(
+        "--base-url",
+        default=os.environ.get("SCRAPER_BASE_URL", "http://nivelarena.co.kr"),
+        help="Board site root (env: SCRAPER_BASE_URL).",
+    )
+    parser.add_argument(
+        "--board-id",
+        default=os.environ.get("SCRAPER_BOARD_ID", "cardlists"),
+        help="GnuBoard bo_table value (env: SCRAPER_BOARD_ID).",
+    )
+    parser.add_argument(
+        "--max-pages",
+        type=int,
+        default=int(os.environ["SCRAPER_MAX_PAGES"]) if os.environ.get("SCRAPER_MAX_PAGES") else None,
+        help="Stop after N pages (env: SCRAPER_MAX_PAGES). Default: all pages.",
+    )
+    parser.add_argument(
+        "--min-delay",
+        type=float,
+        default=_env_float("SCRAPER_MIN_DELAY", 5.0),
+        help="Minimum seconds between cards (env: SCRAPER_MIN_DELAY).",
+    )
+    parser.add_argument(
+        "--max-delay",
+        type=float,
+        default=_env_float("SCRAPER_MAX_DELAY", 10.0),
+        help="Maximum seconds between cards (env: SCRAPER_MAX_DELAY).",
+    )
+    parser.add_argument(
+        "--ignore-robots",
+        action="store_true",
+        help="Do not fetch or honour robots.txt.",
+    )
+    parser.add_argument(
+        "--repair-filenames",
+        action="store_true",
+        help="Repoint DB rows at their real on-disk filenames, then exit.",
+    )
+    parser.add_argument(
+        "--import-sqlite",
+        metavar="PATH",
+        help="Import scrape history from a pre-PostgreSQL scraper.db, then exit.",
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="With --repair-filenames or --import-sqlite, write the changes instead of previewing.",
+    )
+    parser.add_argument("--verbose", action="store_true", help="Enable debug logging.")
+    return parser
+
+
+def main(argv=None):
+    args = build_arg_parser().parse_args(argv)
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    if args.min_delay > args.max_delay:
+        build_arg_parser().error("--min-delay must not exceed --max-delay")
+
+    # Maintenance modes never touch the network, so they never need robots.txt.
+    maintenance = args.repair_filenames or args.import_sqlite
+
+    try:
+        scraper = NivelArenaScraper(
+            args.base_url,
+            args.board_id,
+            min_delay=args.min_delay,
+            max_delay=args.max_delay,
+            obey_robots=not args.ignore_robots and not maintenance,
+        )
+    except DatabaseNotConfigured as exc:
+        log.error("%s", exc)
+        return 2
+    except psycopg.OperationalError as exc:
+        # The URL is in the exception text on some failures; keep it out of logs.
+        log.error("Could not connect to PostgreSQL: %s", str(exc).strip().splitlines()[0])
+        return 2
+
+    with scraper:
+        if args.repair_filenames:
+            scraper.repair_filenames(dry_run=not args.apply)
+            return 0
+
+        if args.import_sqlite:
+            try:
+                scraper.import_sqlite_history(args.import_sqlite, dry_run=not args.apply)
+            except (FileNotFoundError, sqlite3.Error) as exc:
+                log.error("Import failed: %s", exc)
+                return 1
+            return 0
+
+        try:
+            scraper.scrape_board(max_pages=args.max_pages)
+        except KeyboardInterrupt:
+            log.warning("Interrupted by user; shutting down cleanly.")
+            return 130
+    return 0
+
 
 if __name__ == "__main__":
-    BASE_URL = "http://nivelarena.co.kr"
-    BOARD_ID = "cardlists"
-
-    # REF-7: Use context manager to ensure clean resource cleanup
-    with NivelArenaScraper(BASE_URL, BOARD_ID) as scraper:
-        scraper.scrape_board()
+    raise SystemExit(main())

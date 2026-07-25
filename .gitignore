@@ -1,33 +1,21 @@
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
-env/
-build/
-develop-eggs/
-dist/
-eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-*.egg-info/
-.installed.cfg
-*.egg
 
 # Virtual Environments
 venv/
 .venv/
-ENV/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+
+# Secrets
+.env
 
 # Project specific
 .gemini/
 data/
 downloads/
 processed/
-
-# Misc
-.DS_Store
+*.part
