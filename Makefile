@@ -20,6 +20,7 @@ LOAD_ENV_HOST = $(LOAD_ENV) export SCRAPER_DATABASE_URL="$${SCRAPER_DATABASE_URL
 .PHONY: help setup build up up-d convert down logs shell \
         venv test test-db-up test-db-down lint fmt audit check \
         repair-db repair-db-apply import-sqlite import-sqlite-apply \
+        backfill-metadata backfill-metadata-apply \
         purge-db purge-downloads
 
 help: ## Show this help message
@@ -102,9 +103,20 @@ import-sqlite-apply: ## Import history from the pre-PostgreSQL data/scraper.db
 	@$(LOAD_ENV_HOST) SCRAPER_DOWNLOADS_DIR=downloads \
 		$(VENV)/bin/python main.py --import-sqlite data/scraper.db --apply
 
+backfill-metadata: ## Preview fetching metadata for cards already downloaded
+	@$(LOAD_ENV_HOST) SCRAPER_DOWNLOADS_DIR=downloads \
+		$(VENV)/bin/python main.py --backfill-metadata
+
+backfill-metadata-apply: ## Fetch metadata for cards already downloaded (no images are re-downloaded)
+	@$(LOAD_ENV_HOST) SCRAPER_DOWNLOADS_DIR=downloads \
+		$(VENV)/bin/python main.py --backfill-metadata --apply $(ARGS)
+
+# Deliberately leaves `cards` alone: it belongs to the tracker app, and
+# truncating it would cascade into the collection the user has built up.
 purge-db: ## Delete the scraping history (requires CONFIRM=yes)
 	@test "$(CONFIRM)" = "yes" || { \
 		echo "This truncates scraped_cards in the shared nivel database."; \
+		echo "The cards catalogue is left alone -- clearing it would take the collection with it."; \
 		echo "Re-run with: make purge-db CONFIRM=yes"; exit 1; }
 	@$(LOAD_ENV) podman exec -i nivel-db psql "$$SCRAPER_DATABASE_URL" \
 		-c "TRUNCATE scraped_cards"

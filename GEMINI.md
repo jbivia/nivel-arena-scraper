@@ -10,15 +10,19 @@ A Python web scraper that extracts high-resolution trading card images from `niv
   - **Requests**: HTTP requests and AJAX calls.
   - **BeautifulSoup4**: HTML parsing.
   - **OpenCV** (`opencv-python-headless`): Background removal.
-  - **PostgreSQL** (via `psycopg` 3): Tracks scraped cards via `wr_id`, in a `scraped_cards`
-    table the scraper creates itself. The server is the one from the sibling
+  - **PostgreSQL** (via `psycopg` 3): Tracks scraped cards via `wr_id` in a `scraped_cards`
+    table it creates itself, and fills the `cards` catalogue table, which belongs to the
+    tracker app's drizzle migrations — the scraper upserts on `wr_id` and verifies the
+    table's columns at startup rather than creating it. The server is the one from the sibling
     `nivel-arena-collection-tracker` stack (container `nivel-db`, database `nivel`);
     `compose.yaml` joins that stack's external network instead of declaring its own database.
   - **Podman/Docker Compose**: Containerized execution.
 - **Architecture**:
   - The scraper iterates through the board's pagination (`/bbs/board.php?bo_table=…&page=N`).
   - Board links encode `{image_filename}♬{wr_id}` — U+266C is the site's custom delimiter.
-  - Card metadata comes from an AJAX endpoint (`/skin/board/card_list_new/get_info.php`).
+  - Card metadata comes from an AJAX endpoint (`/skin/board/card_list_new/get_info.php`), which
+    serves every printed field as text; `card_metadata.py` parses it into the `cards` table. No OCR
+    is involved — see `RULES.md` for the field mapping and the site's markup quirks.
   - Images are downloaded from `/data/file/{board_id}/{image_filename}` and saved as `{card_id}.jpg`.
   - `convert_to_png.py` flood-fills the white background to transparent, in parallel.
 
@@ -35,7 +39,9 @@ A Python web scraper that extracts high-resolution trading card images from `niv
 | `make convert` | Convert downloaded JPGs to transparent PNGs |
 | `make down` | Stop the scraper |
 | `make logs` | Follow container logs |
-| `make purge-db` | Reset scraping history (needs `CONFIRM=yes`) |
+| `make backfill-metadata` | Preview fetching metadata for cards already downloaded |
+| `make backfill-metadata-apply` | Fetch that metadata (images are not re-downloaded) |
+| `make purge-db` | Reset scraping history — leaves `cards` alone (needs `CONFIRM=yes`) |
 | `make import-sqlite` | Import history from the pre-2.0.0 `data/scraper.db` |
 | `make help` | List all targets |
 
@@ -78,7 +84,7 @@ All settings are CLI flags or environment variables — nothing requires editing
 ## Development Conventions
 
 - **Security**: The target site is HTTP-only, so all responses are treated as untrusted: size caps, content-type and magic-byte validation, cross-host redirect refusal, and filename sanitization. The container runs as non-root with a read-only rootfs and all capabilities dropped.
-- **Persistence**: Images in `./downloads`, PNGs in `./processed`, history in the `scraped_cards` PostgreSQL table. The connection is autocommit so a long scrape never holds an idle transaction open against a database the tracker app shares; `repair_filenames` and the SQLite import open explicit transactions.
+- **Persistence**: Images in `./downloads`, PNGs in `./processed`, history in the `scraped_cards` PostgreSQL table and card fields in `cards` (owned by the tracker app's migrations; run `make db-migrate` there before the first scrape). The connection is autocommit so a long scrape never holds an idle transaction open against a database the tracker app shares; `repair_filenames` and the SQLite import open explicit transactions.
 - **Credentials**: `SCRAPER_DATABASE_URL` is environment-only and deliberately has no CLI flag (`argv` is world-readable via `/proc`). It comes from `.env`, which is gitignored; `redact_conninfo()` strips the password before anything is logged.
 - **Error Handling**: All HTTP calls carry timeouts; transient errors (429, 5xx) retry with exponential backoff; a run survives isolated page failures and gives up after `MAX_CONSECUTIVE_PAGE_FAILURES`.
 - **Resource Management**: `NivelArenaScraper` is a context manager, closing both the DB connection and the HTTP session.

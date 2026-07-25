@@ -1,12 +1,16 @@
-"""Scrape trading card images from a GnuBoard5 card board.
+"""Scrape trading card images and metadata from a GnuBoard5 card board.
 
 The target site is served over plaintext HTTP only (it has no TLS listener), so
 every response has to be treated as untrusted input: sizes are capped, content
 types are checked, and cross-host redirects are refused.
 
-Scrape progress is tracked in PostgreSQL. The connection string is read from
-``SCRAPER_DATABASE_URL`` and is deliberately not exposed as a CLI flag: argv is
-world-readable in ``/proc``, and the URL carries the password.
+Two tables are written. ``scraped_cards`` is the scraper's own and tracks what
+has been downloaded. ``cards`` is the catalogue the sibling
+``nivel-arena-collection-tracker`` app reads and whose shape its drizzle
+migrations own -- this scraper fills it, keyed on ``wr_id``, but never creates
+or alters it. The connection string is read from ``SCRAPER_DATABASE_URL`` and is
+deliberately not exposed as a CLI flag: argv is world-readable in ``/proc``, and
+the URL carries the password.
 """
 
 import argparse
@@ -26,6 +30,8 @@ import requests
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+import card_metadata
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger("scraper")
@@ -146,8 +152,40 @@ def parse_card_link(href):
     return img_filename, wr_id
 
 
+# Columns the scraper writes into the tracker app's `cards` table. Checked at
+# startup so a database that has not had the app's migrations applied says so,
+# instead of failing on the first insert.
+CARD_COLUMNS = frozenset(
+    {
+        "wr_id",
+        "number",
+        "set_code",
+        "name",
+        "type",
+        "type_en",
+        "element",
+        "element_en",
+        "cost",
+        "power",
+        "hit",
+        "rarity",
+        "affiliation",
+        "keywords",
+        "effect",
+        "trigger_text",
+        "product_name",
+        "ip",
+        "image_filename",
+    }
+)
+
+
 class DatabaseNotConfigured(RuntimeError):
     """Raised when no PostgreSQL connection string is available."""
+
+
+class CatalogueTableMissing(RuntimeError):
+    """Raised when the app's ``cards`` table is absent or predates this scraper."""
 
 
 class NivelArenaScraper:
@@ -259,8 +297,10 @@ class NivelArenaScraper:
     # --- database ---------------------------------------------------------
 
     def _init_db(self):
-        # The scraper owns this table outright; it lives alongside the tracker
-        # app's drizzle-managed tables but is never touched by its migrations.
+        # scraped_cards is the scraper's own, created here. `cards` is not: it
+        # belongs to the tracker app's drizzle migrations, so it is verified
+        # rather than created -- writing our own version of it would leave two
+        # definitions to drift apart, and would break the app's next migration.
         self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS scraped_cards (
@@ -271,7 +311,36 @@ class NivelArenaScraper:
             )
             """
         )
+        self._verify_cards_table()
         log.info("Database ready at %s", redact_conninfo(self.database_url))
+
+    def _verify_cards_table(self):
+        """Fail early and clearly if the catalogue table is missing or stale.
+
+        Without this the first insert fails deep into a scrape with a bare
+        ``UndefinedColumn``, which says nothing about the migration that has not
+        been run.
+        """
+        present = {
+            name
+            for (name,) in self._conn.execute(
+                "SELECT column_name FROM information_schema.columns"
+                " WHERE table_name = 'cards' AND table_schema = current_schema()"
+            ).fetchall()
+        }
+
+        if not present:
+            raise CatalogueTableMissing(
+                "No 'cards' table in this database. Its schema belongs to the "
+                "nivel-arena-collection-tracker app -- run `make db-migrate` there first."
+            )
+
+        missing = sorted(CARD_COLUMNS - present)
+        if missing:
+            raise CatalogueTableMissing(
+                f"The 'cards' table is missing {', '.join(missing)}. It is probably an older "
+                "revision -- run `make db-migrate` in nivel-arena-collection-tracker."
+            )
 
     def is_already_scraped(self, wr_id):
         cursor = self._conn.execute("SELECT 1 FROM scraped_cards WHERE wr_id = %s", (wr_id,))
@@ -284,6 +353,82 @@ class NivelArenaScraper:
             " ON CONFLICT (wr_id) DO NOTHING",
             (wr_id, card_id, image_filename),
         )
+
+    def upsert_card(self, wr_id, details, image_filename=None):
+        """Write one card's catalogue fields, refreshing an existing row.
+
+        DO UPDATE rather than DO NOTHING: the site corrects card text after
+        release, and a re-scrape should carry the correction through. The
+        filename is coalesced because a metadata backfill knows the row it is
+        filling but not necessarily the file it was saved as.
+
+        ``name`` and ``number`` are NOT NULL in the app's schema, so a card
+        whose header would not parse is skipped rather than half-written.
+
+        Lists map to PostgreSQL ``TEXT[]`` directly under psycopg 3; every
+        value is bound, none is interpolated.
+        """
+        if not details["card_number"] or not details["name"]:
+            log.warning(
+                "Skipping catalogue row for wr_id %s: no %s parsed.",
+                wr_id,
+                "card number" if not details["card_number"] else "name",
+            )
+            return False
+
+        self._conn.execute(
+            """
+            INSERT INTO cards (
+                wr_id, number, set_code, name, type, type_en,
+                element, element_en, cost, power, hit, rarity, affiliation,
+                keywords, effect, trigger_text, product_name, ip, image_filename
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            )
+            ON CONFLICT (wr_id) DO UPDATE SET
+                number = EXCLUDED.number,
+                set_code = EXCLUDED.set_code,
+                name = EXCLUDED.name,
+                type = EXCLUDED.type,
+                type_en = EXCLUDED.type_en,
+                element = EXCLUDED.element,
+                element_en = EXCLUDED.element_en,
+                cost = EXCLUDED.cost,
+                power = EXCLUDED.power,
+                hit = EXCLUDED.hit,
+                rarity = EXCLUDED.rarity,
+                affiliation = EXCLUDED.affiliation,
+                keywords = EXCLUDED.keywords,
+                effect = EXCLUDED.effect,
+                trigger_text = EXCLUDED.trigger_text,
+                product_name = EXCLUDED.product_name,
+                ip = EXCLUDED.ip,
+                image_filename = COALESCE(EXCLUDED.image_filename, cards.image_filename),
+                updated_at = now()
+            """,
+            (
+                wr_id,
+                details["card_number"],
+                details["set_code"],
+                details["name"],
+                details["card_type"],
+                details["card_type_en"],
+                details["element"],
+                details["element_en"],
+                details["cost"],
+                details["power"],
+                details["hit"],
+                details["rarity"],
+                details["affiliation"],
+                details["keywords"],
+                details["effect"],
+                details["trigger_text"],
+                details["product_name"],
+                details["ip"],
+                image_filename,
+            ),
+        )
+        return True
 
     # --- http -------------------------------------------------------------
 
@@ -452,11 +597,17 @@ class NivelArenaScraper:
             log.error("Failed to retrieve details for wr_id %s: %s", wr_id, exc)
             return
 
+        # A card whose metadata will not parse is still worth downloading, so a
+        # parse failure degrades to "image only" instead of losing the card.
+        details = None
+        try:
+            details = card_metadata.parse_card_details(detail_soup)
+        except Exception as exc:
+            log.error("Could not parse metadata for wr_id %s: %s", wr_id, exc)
+
         card_id = f"unknown_{wr_id}"
-        type_header = detail_soup.select_one("#type")
-        if type_header:
-            raw_text = type_header.get_text(strip=True).split("/")[0]
-            card_id = safe_stem(raw_text, fallback=f"unknown_{wr_id}")
+        if details and details["card_number"]:
+            card_id = safe_stem(details["card_number"], fallback=f"unknown_{wr_id}")
 
         # quote() keeps a hostile filename from injecting query/fragment parts
         # into the URL; parse_card_link has already rejected path separators.
@@ -470,6 +621,86 @@ class NivelArenaScraper:
 
         if actual_filename:
             self.mark_as_scraped(wr_id, card_id, actual_filename)
+            if details:
+                self.upsert_card(wr_id, details, actual_filename)
+
+    def backfill_metadata(self, dry_run=True, limit=None, force=False):
+        """Fetch catalogue fields for cards already downloaded.
+
+        Images are never re-downloaded: this only re-hits the detail endpoint,
+        which is what the scraper does anyway for every card it walks past. The
+        connection is autocommit, so an interrupted run keeps the rows it has
+        already written and the next run picks up where it stopped.
+
+        Returns ``(processed, failures)``.
+        """
+        if force:
+            query = "SELECT wr_id, image_filename FROM scraped_cards ORDER BY wr_id"
+        else:
+            query = (
+                "SELECT s.wr_id, s.image_filename FROM scraped_cards s"
+                " LEFT JOIN cards c USING (wr_id)"
+                " WHERE c.wr_id IS NULL ORDER BY s.wr_id"
+            )
+
+        if limit is not None:
+            rows = self._conn.execute(f"{query} LIMIT %s", (limit,)).fetchall()
+        else:
+            rows = self._conn.execute(query).fetchall()
+
+        if dry_run:
+            # Deliberately makes no requests: a preview that hammered the site
+            # for 500 cards would be worse than the operation it previews.
+            log.info(
+                "Dry run: metadata would be fetched for %d card(s)%s.",
+                len(rows),
+                " (refreshing rows that already have it)" if force else "",
+            )
+            return len(rows), 0
+
+        if not rows:
+            log.info("Nothing to backfill: every scraped card already has metadata.")
+            return 0, 0
+
+        # One robots check for the endpoint, rather than the same question 500
+        # times over.
+        if not self._may_fetch(self.ajax_url):
+            log.error("robots.txt disallows the detail endpoint; nothing to do.")
+            return 0, 0
+
+        processed, failures, consecutive_failures = 0, 0, 0
+        for index, (wr_id, image_filename) in enumerate(rows):
+            if index:
+                delay = random.uniform(self.min_delay, self.max_delay)  # noqa: S311 - politeness jitter
+                log.info("Sleeping %.2fs to respect rate limits...", delay)
+                time.sleep(delay)
+
+            try:
+                details = card_metadata.parse_card_details(self.get_card_details(wr_id))
+            except Exception as exc:
+                failures += 1
+                consecutive_failures += 1
+                log.error(
+                    "Failed to fetch metadata for wr_id %s (%d/%d consecutive failures): %s",
+                    wr_id,
+                    consecutive_failures,
+                    MAX_CONSECUTIVE_PAGE_FAILURES,
+                    exc,
+                )
+                if consecutive_failures >= MAX_CONSECUTIVE_PAGE_FAILURES:
+                    log.error("Giving up after %d consecutive failures.", consecutive_failures)
+                    break
+                continue
+
+            consecutive_failures = 0
+            if self.upsert_card(wr_id, details, image_filename):
+                processed += 1
+                log.info("Stored metadata for wr_id %s (%s).", wr_id, details["card_number"])
+            else:
+                failures += 1
+
+        log.info("Backfill complete: %d stored, %d failed (of %d rows).", processed, failures, len(rows))
+        return processed, failures
 
     # --- maintenance ------------------------------------------------------
 
@@ -628,9 +859,26 @@ def build_arg_parser():
         help="Import scrape history from a pre-PostgreSQL scraper.db, then exit.",
     )
     parser.add_argument(
+        "--backfill-metadata",
+        action="store_true",
+        help="Fetch catalogue metadata for cards already downloaded, then exit. No images are re-downloaded.",
+    )
+    parser.add_argument(
+        "--backfill-limit",
+        type=int,
+        metavar="N",
+        help="With --backfill-metadata, stop after N cards.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="With --backfill-metadata, refresh rows that already have metadata instead of skipping them.",
+    )
+    parser.add_argument(
         "--apply",
         action="store_true",
-        help="With --repair-filenames or --import-sqlite, write the changes instead of previewing.",
+        help="With --repair-filenames, --import-sqlite or --backfill-metadata, write the changes"
+        " instead of previewing.",
     )
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging.")
     return parser
@@ -644,7 +892,12 @@ def main(argv=None):
     if args.min_delay > args.max_delay:
         build_arg_parser().error("--min-delay must not exceed --max-delay")
 
-    # Maintenance modes never touch the network, so they never need robots.txt.
+    if args.backfill_limit is not None and args.backfill_limit < 1:
+        build_arg_parser().error("--backfill-limit must be at least 1")
+
+    # These maintenance modes never touch the network, so they never need
+    # robots.txt. --backfill-metadata is not among them: it makes real requests,
+    # and so stays subject to the same crawl rules as a scrape.
     maintenance = args.repair_filenames or args.import_sqlite
 
     try:
@@ -655,7 +908,7 @@ def main(argv=None):
             max_delay=args.max_delay,
             obey_robots=not args.ignore_robots and not maintenance,
         )
-    except DatabaseNotConfigured as exc:
+    except (DatabaseNotConfigured, CatalogueTableMissing) as exc:
         log.error("%s", exc)
         return 2
     except psycopg.OperationalError as exc:
@@ -677,7 +930,14 @@ def main(argv=None):
             return 0
 
         try:
-            scraper.scrape_board(max_pages=args.max_pages)
+            if args.backfill_metadata:
+                scraper.backfill_metadata(
+                    dry_run=not args.apply,
+                    limit=args.backfill_limit,
+                    force=args.force,
+                )
+            else:
+                scraper.scrape_board(max_pages=args.max_pages)
         except KeyboardInterrupt:
             log.warning("Interrupted by user; shutting down cleanly.")
             return 130
