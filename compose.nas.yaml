@@ -1,0 +1,121 @@
+# Standalone deployment: the scraper plus a PostgreSQL of its own.
+#
+# For a NAS (or any host) where nivel-arena-collection-tracker is NOT deployed.
+# The bundled database is bootstrapped from db/init/01-cards.sql, which mirrors
+# the `cards` table the app would otherwise have migrated into place.
+#
+# If the Nuxt app is on the same box, use compose.nas.tracker.yaml instead. That
+# is the intended arrangement: the app owns the catalogue schema, this scraper
+# only fills it. Two databases means two catalogues, and the collection lives in
+# only one of them.
+#
+# Written for Docker, which is what Synology's Container Manager ships. It is
+# deliberately not compose.yaml with a few edits -- that file is the Podman
+# development stack and uses `userns_mode: keep-id` and `:Z` volume relabels,
+# the first of which Docker rejects outright and the second of which it ignores.
+#
+# Nothing here uses a Compose feature newer than v2.9, which is what DSM 7.2
+# carries -- notably no `depends_on.required` and no `develop` block.
+#
+#   cp .env.nas.example .env && chmod 600 .env    # then edit it
+#   mkdir -p downloads processed
+#   sudo chown -R "$PUID:$PGID" downloads processed
+#   docker compose -f compose.nas.yaml up -d db
+#   docker compose -f compose.nas.yaml run --rm scraper
+
+services:
+  db:
+    image: postgres:18-alpine
+    container_name: nivel-scraper-db
+    # The database is the long-lived half of this stack and should come back
+    # with the NAS. The scraper below is the half that must not.
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-nivel}
+      # No `:?` default-or-fail here: Compose interpolates this file even when
+      # only the scraper is being run, so a hard requirement would break the
+      # `run --rm scraper` path. Left unset, the postgres image itself refuses
+      # to initialise and says so.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-nivel}
+
+    volumes:
+      # PG18 moved PGDATA to /var/lib/postgresql/<major>/docker and declares the
+      # volume one level up -- do not mount .../data here.
+      - pgdata:/var/lib/postgresql
+      # The postgres entrypoint runs these once, and only against an empty data
+      # directory. Editing the SQL later will not re-apply it; see README.
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+
+    # Not published to the LAN. Nothing outside this stack needs the database,
+    # and DSM boxes are routinely reachable from the whole house.
+    expose:
+      - "5432"
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-nivel} -d ${POSTGRES_DB:-nivel}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  scraper:
+    build:
+      context: .
+      dockerfile: Containerfile
+    image: nivel-arena-scraper:nas
+
+    # No container_name: `docker compose run` refuses to start a service that
+    # pins one, and `run --rm` is how this job is meant to be invoked.
+    #
+    # No restart policy either. main() walks the board once and returns --
+    # `unless-stopped` would treat that clean exit as a crash and re-scrape the
+    # entire board, forever, against a site with no HTTPS and a politeness
+    # budget. Schedule it instead: DSM Task Scheduler -> User-defined script.
+    restart: "no"
+
+    depends_on:
+      db:
+        condition: service_healthy
+
+    # DSM's first local user is uid 1026 and its `users` group is gid 100, which
+    # is nothing like the uid 1000 baked into the image. The bind mounts below
+    # are owned by the host, so the container has to run as whoever owns them --
+    # the root filesystem is read-only, so those two directories are the only
+    # things it ever writes to. `chown -R "$PUID:$PGID" downloads processed`.
+    user: "${PUID:-1000}:${PGID:-1000}"
+
+    # Untrusted, plaintext-HTTP content goes into OpenCV's native decoders here.
+    # Same lockdown as the development stack.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+
+    # A 920+ has 8 GB and is also serving files. 2 GB bounds a decompression
+    # bomb or a runaway retry loop without starving DSM.
+    mem_limit: 2g
+    pids_limit: 256
+
+    # Crawl delays and any other SCRAPER_* tunables. Not the database URL --
+    # that is composed below from the same credentials the db service uses, so
+    # there is one password in .env rather than two that can disagree.
+    env_file:
+      - .env
+
+    environment:
+      SCRAPER_DATABASE_URL: postgres://${POSTGRES_USER:-nivel}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-nivel}
+      SCRAPER_DOWNLOADS_DIR: /app/downloads
+      SCRAPER_PROCESSED_DIR: /app/processed
+
+    volumes:
+      # No `:Z` -- DSM does not run SELinux, and Docker would ignore it anyway.
+      - ./downloads:/app/downloads
+      - ./processed:/app/processed
+
+volumes:
+  pgdata:

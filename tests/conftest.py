@@ -11,6 +11,7 @@ two tests can never see each other's rows.
 
 import os
 import uuid
+from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import pytest
@@ -19,34 +20,13 @@ TEST_DATABASE_URL_ENV = "SCRAPER_TEST_DATABASE_URL"
 
 # The scraper writes the catalogue but does not own its shape: `cards` belongs
 # to nivel-arena-collection-tracker's drizzle migrations (0003_scraped_catalogue).
-# Mirrored here so the tests can stand it up in their throwaway schema. Keep it
-# in step with that app's `server/db/schema.ts` -- `main._verify_cards_table`
-# is what catches the two drifting apart at runtime.
-CARDS_TABLE_DDL = """
-CREATE TABLE cards (
-    id SERIAL PRIMARY KEY,
-    wr_id TEXT NOT NULL UNIQUE,
-    number TEXT NOT NULL,
-    set_code TEXT,
-    name TEXT NOT NULL,
-    type TEXT,
-    type_en TEXT,
-    element TEXT,
-    element_en TEXT,
-    cost INTEGER,
-    power INTEGER,
-    hit INTEGER,
-    rarity TEXT,
-    affiliation TEXT[] NOT NULL DEFAULT '{}',
-    keywords TEXT[] NOT NULL DEFAULT '{}',
-    effect TEXT,
-    trigger_text TEXT,
-    product_name TEXT,
-    ip TEXT,
-    image_filename TEXT,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-)
-"""
+# The mirror this repository keeps of that shape lives in db/init/01-cards.sql,
+# where the standalone deployment's PostgreSQL also reads it from -- one copy,
+# two consumers, so a re-sync cannot leave the tests agreeing with a schema the
+# deployed database does not have. test_nas_schema.py gates the mirror itself;
+# `main._verify_cards_table` is what catches drift at runtime.
+CARDS_TABLE_SQL = Path(__file__).resolve().parent.parent / "db" / "init" / "01-cards.sql"
+CARDS_TABLE_DDL = CARDS_TABLE_SQL.read_text(encoding="utf-8")
 
 
 def _with_search_path(url, schema):

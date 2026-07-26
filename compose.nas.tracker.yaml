@@ -1,0 +1,75 @@
+# Satellite deployment: the scraper alone, filling the catalogue of a
+# nivel-arena-collection-tracker stack already running on the same host.
+#
+# This is the correct file whenever the Nuxt app is deployed here. The app owns
+# the `cards` schema through its drizzle migrations; this scraper only upserts
+# rows into it. There is no database service below on purpose -- the tracker's
+# compose.prod.yaml owns it, and a second one would mean a second catalogue with
+# the collection attached to only one of them.
+#
+# A complete file rather than an overlay on compose.nas.yaml: removing a service
+# from a merged stack is not something Compose does cleanly, and the tracker
+# repository uses the same one-file-per-deployment convention.
+#
+# Before the first run, apply the app's migrations -- `npx drizzle-kit migrate`
+# in the app container, or `make db-migrate` in that repository. Without them
+# main._verify_cards_table() stops the scraper at startup and names the fix.
+#
+#   cp .env.nas.example .env && chmod 600 .env
+#   # then set SCRAPER_DATABASE_URL to the tracker's database, and
+#   # NIVEL_NETWORK if Container Manager named the project something else
+#   docker compose -f compose.nas.tracker.yaml run --rm scraper
+
+services:
+  scraper:
+    build:
+      context: .
+      dockerfile: Containerfile
+    image: nivel-arena-scraper:nas
+
+    # See compose.nas.yaml: no container_name so `run --rm` works, and no
+    # restart policy because a completed scrape is a clean exit, not a crash.
+    restart: "no"
+
+    # Match whoever owns the bind mounts on the host. DSM's first local user is
+    # uid 1026, group `users` is gid 100.
+    user: "${PUID:-1000}:${PGID:-1000}"
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+
+    mem_limit: 2g
+    pids_limit: 256
+
+    # Carries SCRAPER_DATABASE_URL, which here points at the tracker's database
+    # -- by default the container_name its compose.prod.yaml gives it:
+    #   postgres://nivel:PASSWORD@nivel-db-prod:5432/nivel
+    # The password never belongs in this file or in argv.
+    env_file:
+      - .env
+
+    environment:
+      SCRAPER_DOWNLOADS_DIR: /app/downloads
+      SCRAPER_PROCESSED_DIR: /app/processed
+
+    volumes:
+      - ./downloads:/app/downloads
+      - ./processed:/app/processed
+
+    networks:
+      - nivel
+
+networks:
+  # Joining the tracker stack's network is what makes its database hostname
+  # resolve; this file does not create it. Start that stack first. Compose names
+  # a project's default network `<project>_default`, and Container Manager takes
+  # the project name from what you called it in the UI -- set NIVEL_NETWORK in
+  # .env if that is not the directory name. `docker network ls` shows the truth.
+  nivel:
+    external: true
+    name: ${NIVEL_NETWORK:-nivel-arena-collection-tracker_default}
