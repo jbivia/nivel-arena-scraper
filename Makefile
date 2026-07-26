@@ -24,7 +24,7 @@ UV = $(VENV)/bin/uv
 UV_COMPILE = $(UV) pip compile --universal --generate-hashes --no-annotate \
              --python-version 3.12 --custom-compile-command "make lock"
 
-.PHONY: help setup build up up-d convert down logs shell \
+.PHONY: help setup build up up-d convert down logs shell nas-validate \
         venv lock lock-upgrade verify-locks test test-db-up test-db-down \
         lint fmt audit check \
         repair-db repair-db-apply import-sqlite import-sqlite-apply \
@@ -64,6 +64,15 @@ logs: ## Follow container logs
 
 shell: ## Open a shell inside the running container
 	$(COMPOSE) exec scraper /bin/sh
+
+# The Synology files are never run on this machine, so nothing else would catch
+# a typo in them before it reaches the NAS. Interpolated against
+# .env.nas.example rather than .env so the result does not depend on whichever
+# credentials happen to be configured locally.
+nas-validate: ## Check that the Synology compose files parse and interpolate
+	$(COMPOSE) -f compose.nas.yaml --env-file .env.nas.example config -q
+	$(COMPOSE) -f compose.nas.tracker.yaml --env-file .env.nas.example config -q
+	@echo "Synology compose files are valid."
 
 # --- development -------------------------------------------------------------
 

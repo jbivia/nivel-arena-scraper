@@ -15,22 +15,26 @@ A containerized Python scraper that collects high-resolution trading card images
 ## Project Structure
 
 ```text
-├── main.py                 # Scraper (Requests + BeautifulSoup)
-├── card_metadata.py        # Detail-response parser (no I/O)
-├── convert_to_png.py       # Image processing (OpenCV)
-├── RULES.md                # Card layout and metadata field reference
-├── tests/                  # Test suite
-├── compose.yaml            # Container orchestration
-├── Containerfile           # Container image definition
-├── Makefile                # Command shortcuts
-├── pyproject.toml          # Project metadata + lint/test configuration
-├── requirements.txt        # Direct runtime dependencies (edit this)
-├── requirements-dev.txt    # Direct dev/CI dependencies (edit this)
-├── requirements.lock       # Resolved + hash-pinned; what actually installs
-├── requirements-dev.lock   # Same, for the dev tree
-├── .env.example            # Connection settings template
-├── downloads/              # Raw JPG downloads (host-mounted)
-└── processed/              # Transparent PNGs (host-mounted)
+├── main.py                  # Scraper (Requests + BeautifulSoup)
+├── card_metadata.py         # Detail-response parser (no I/O)
+├── convert_to_png.py        # Image processing (OpenCV)
+├── RULES.md                 # Card layout and metadata field reference
+├── tests/                   # Test suite
+├── compose.yaml             # Development stack (Podman), satellite of the tracker
+├── compose.nas.yaml         # Standalone deployment: scraper + its own PostgreSQL
+├── compose.nas.tracker.yaml # Satellite deployment: scraper only, tracker owns the DB
+├── db/init/                 # `cards` DDL mirror, for databases no app migrates
+├── Containerfile            # Container image definition
+├── Makefile                 # Command shortcuts
+├── pyproject.toml           # Project metadata + lint/test configuration
+├── requirements.txt         # Direct runtime dependencies (edit this)
+├── requirements-dev.txt     # Direct dev/CI dependencies (edit this)
+├── requirements.lock        # Resolved + hash-pinned; what actually installs
+├── requirements-dev.lock    # Same, for the dev tree
+├── .env.example             # Connection settings template (development)
+├── .env.nas.example         # Connection settings template (Docker/Synology)
+├── downloads/               # Raw JPG downloads (host-mounted)
+└── processed/               # Transparent PNGs (host-mounted)
 ```
 
 ## Prerequisites
@@ -89,6 +93,29 @@ The instance itself belongs to the sibling [nivel-arena-collection-tracker](../n
 
 To point at some other PostgreSQL instead, set `SCRAPER_DATABASE_URL` accordingly and drop the `networks:` block from `compose.yaml`.
 
+### The schema mirror
+
+Two deployments have no app to migrate `cards` into place: the standalone stack in
+`compose.nas.yaml`, and the throwaway schemas the test suite runs in. Both bootstrap the table from
+**`db/init/01-cards.sql`** — one mirror of the app's shape, read by both, so a re-sync cannot leave
+the tests agreeing with a schema the deployed database does not have.
+
+It is still a copy, and the failure mode of a copy is silent divergence, so `tests/test_nas_schema.py`
+gates it from both sides:
+
+| Gate | Catches | Runs |
+| --- | --- | --- |
+| Mirror covers `main.CARD_COLUMNS` | A column the scraper writes that the mirror lacks — a standalone scrape that dies at startup | Always |
+| `wr_id` declared `UNIQUE` | A mirror the catalogue's `ON CONFLICT (wr_id)` cannot upsert against | Always |
+| Mirror matches the app's `schema.ts` | The two definitions drifting apart, in either direction | When the tracker repo is checked out alongside |
+| Every app column is one the scraper writes | A column the app added that the scraper silently leaves `NULL` forever | When the tracker repo is checked out alongside |
+
+The last two need both repositories, so they skip in CI — the same way the PostgreSQL-backed tests
+skip without a server. Set `NIVEL_TRACKER_REPO` if the tracker is not the sibling directory.
+
+None of this makes the scraper an owner of `cards`. Where the app exists, the app migrates the table
+and `main._verify_cards_table` only checks the result.
+
 ## Quick Start
 
 ```bash
@@ -140,6 +167,82 @@ make backfill-metadata-apply ARGS="--backfill-limit 5"   # or just the first few
 It is resumable — the connection is autocommit, so an interrupted run keeps what it stored and the
 next one continues where it stopped. Add `--force` to refresh rows that already have metadata, which
 is what to run after adding a missing value to `card_metadata.CARD_TYPE_EN` or `ELEMENT_EN`.
+
+## Deploying to a Synology NAS
+
+`compose.yaml` is the Podman development stack and does not run under Docker: `userns_mode: keep-id`
+is Podman-only and Docker rejects it, and the `:Z` volume relabels are meaningless without SELinux.
+DSM's Container Manager is Docker, so there are two Docker-native files instead. Pick by whether the
+Nuxt app is on the same box:
+
+| | File | Database |
+| --- | --- | --- |
+| Tracker app **is** deployed here | `compose.nas.tracker.yaml` | The app's, joined over its network |
+| Tracker app is **not** deployed here | `compose.nas.yaml` | Bundled, bootstrapped from `db/init/` |
+
+**Prefer the satellite file whenever the app is present.** Two databases means two catalogues, and
+the collection is attached to only one of them. A database bootstrapped from `db/init/` is
+scraper-only — do not later point the app at it, since drizzle would find `cards` already there with
+no migration journal to explain it.
+
+Both files stay within Compose v2.9, which is what DSM 7.2 ships — no `depends_on.required`, no
+`develop` block.
+
+### Setup
+
+Over SSH, from the project directory (Container Manager puts projects under `/volume1/docker/`):
+
+```bash
+cp .env.nas.example .env && chmod 600 .env
+$EDITOR .env                              # set PUID/PGID and the credentials
+
+mkdir -p downloads processed
+id "$USER"                                # DSM's first user is usually 1026, group `users` 100
+sudo chown -R 1026:100 downloads processed
+
+# standalone
+docker compose -f compose.nas.yaml up -d db
+docker compose -f compose.nas.yaml run --rm scraper
+
+# ...or satellite — apply the app's migrations first, or the scraper stops at startup and says so
+docker compose -f compose.nas.tracker.yaml run --rm scraper
+```
+
+Then convert, once there are images:
+
+```bash
+docker compose -f compose.nas.yaml run --rm scraper python convert_to_png.py
+```
+
+### Scheduling
+
+The scraper is a **one-shot batch job** — it walks the board, exits, and re-runs only fetch what is
+new. Neither file gives it a restart policy on purpose: `unless-stopped` reads a completed scrape as
+a crash and would re-scrape the board in a loop, forever, against a site that has no HTTPS listener.
+
+Drive it from **DSM → Control Panel → Task Scheduler → Create → Scheduled Task → User-defined
+script**, running as `root`:
+
+```bash
+cd /volume1/docker/nivel-arena-scraper && \
+  docker compose -f compose.nas.yaml run --rm scraper
+```
+
+At the default 5–10 s delays a full board takes hours, which is what overnight is for.
+
+### Notes for the 920+
+
+- **Fits comfortably.** The scraper is capped at 2 GB and PostgreSQL adds ~200 MB, against 8 GB. The
+  work is I/O-bound on the crawl delays, so the J4125 idles through it. `convert_to_png.py` defaults
+  to `cpu_count() // 2` — 2 of the 4 cores — and `--workers` overrides it.
+- **Nothing compiles.** Every dependency has an `x86_64` manylinux wheel, and the wheels' SSE4.2
+  baseline is met by Gemini Lake. Building the image on the NAS works; it only adds `libglib2.0-0`.
+- **`db/init/` runs once.** The postgres entrypoint executes it only against an empty data
+  directory. Editing the SQL later changes nothing — apply it by hand, or remove the `pgdata` volume
+  and start over.
+- **Permissions are the usual failure.** The root filesystem is read-only, so `downloads/` and
+  `processed/` are the only paths the container writes to. If `PUID`/`PGID` do not match what owns
+  them on the host, every download fails.
 
 ## Development
 
