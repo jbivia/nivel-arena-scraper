@@ -25,7 +25,11 @@ A Python web scraper that extracts high-resolution trading card images from `niv
     serves every printed field as text; `card_metadata.py` parses it into the `cards` table. No OCR
     is involved — see `RULES.md` for the field mapping and the site's markup quirks.
   - Images are downloaded from `/data/file/{board_id}/{image_filename}` and saved as `{card_id}.jpg`.
-  - `convert_to_png.py` flood-fills the white background to transparent, in parallel.
+  - `convert_to_png.py` masks the white background to transparent, in parallel. It finds the
+    card rectangles by projecting a background mask onto each axis (which separates the outer
+    margins and, on two-card composites such as SB02-001, the gutter between them), then cuts
+    an antialiased rounded-rectangle alpha. Geometric rather than a colour flood fill, which
+    escaped through light artwork and through the gutter.
 
 ## Building and Running
 

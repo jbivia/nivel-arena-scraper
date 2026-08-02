@@ -10,7 +10,9 @@ A containerized Python scraper that collects high-resolution trading card images
 - **Respectful crawling**: Randomized delays, `robots.txt` compliance, and automatic backoff on `429`/`5xx`.
 - **Hardened downloads**: Size caps, content-type and magic-byte checks, cross-host redirect refusal, and atomic writes.
 - **Containerized execution**: Read-only root filesystem, all capabilities dropped, non-root user.
-- **Image post-processing**: OpenCV converts JPGs to transparent PNGs, with a leak guard that refuses to damage artwork.
+- **Image post-processing**: OpenCV converts JPGs to transparent PNGs by detecting the card
+  rectangles geometrically -- outer margins, rounded corners, and the white gutter of a
+  two-card composite all become transparent, and the mask cannot reach into the artwork.
 
 ## Project Structure
 
