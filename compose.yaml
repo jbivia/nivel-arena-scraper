@@ -1,3 +1,14 @@
+# podman-compose puts every service of a project into a pod and passes --pod,
+# which Podman refuses alongside the --userns=keep-id that `userns_mode` below
+# asks for: the pod's infra container already owns the user namespace. This
+# stack is a single container joining the tracker's network, so it has nothing
+# to gain from a pod -- opt out.
+#
+# Only podman-compose reads this. The docker-compose provider ignores unknown
+# top-level `x-` fields, and does not use pods in the first place.
+x-podman:
+  in_pod: false
+
 services:
   scraper:
     build:
