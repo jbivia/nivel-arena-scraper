@@ -210,7 +210,9 @@ docker compose -f compose.nas.yaml run --rm scraper
 docker compose -f compose.nas.tracker.yaml run --rm scraper
 ```
 
-Then convert, once there are images:
+Then convert, once there are images. Same image, same compose file — whichever of the two you just
+used — so this needs no configuration of its own: the container already carries
+`SCRAPER_DOWNLOADS_DIR` and `SCRAPER_PROCESSED_DIR`, which are the defaults the script reads.
 
 ```bash
 docker compose -f compose.nas.yaml run --rm scraper python convert_to_png.py
@@ -223,14 +225,33 @@ new. Neither file gives it a restart policy on purpose: `unless-stopped` reads a
 a crash and would re-scrape the board in a loop, forever, against a site that has no HTTPS listener.
 
 Drive it from **DSM → Control Panel → Task Scheduler → Create → Scheduled Task → User-defined
-script**, running as `root`:
+script**, running as `root`. Scrape, then convert — the conversion needs the JPGs the run before it
+downloaded:
 
 ```bash
 cd /volume1/docker/nivel-arena-scraper && \
-  docker compose -f compose.nas.yaml run --rm scraper
+  docker compose -f compose.nas.yaml run --rm scraper && \
+  docker compose -f compose.nas.yaml run --rm scraper python convert_to_png.py
 ```
 
 At the default 5–10 s delays a full board takes hours, which is what overnight is for.
+
+In the satellite arrangement the same task is also where the app's migrations belong, so a schema
+added between two releases is in place before the next scrape needs it:
+
+```bash
+cd /volume1/docker/nivel-arena-scraper && \
+  docker compose -f compose.nas.tracker.yaml run --rm scraper && \
+  docker compose -f compose.nas.tracker.yaml run --rm scraper python convert_to_png.py && \
+  cd /volume1/docker/nivel-arena-collection-tracker && \
+  docker compose -f compose.nas.yaml run --rm migrate
+```
+
+`&&` between the scrape and the conversion is deliberate: a scrape that failed to start leaves the
+conversion nothing new to do, and it would exit 0 having reported that there was nothing to convert.
+The last one is the arguable link. `convert_to_png.py` exits non-zero when *no* image at all could be
+converted (or `downloads/` is missing), which would then hold back a migration that has nothing to do
+with images — use `;` before the tracker's `cd` if you would rather the migration always run.
 
 ### Notes for the 920+
 
