@@ -11,7 +11,11 @@ venv/
 .ruff_cache/
 
 # Secrets
+# The *.example templates are committed; the settings files filled in from them
+# are not. `.env` is the Podman development stack's, `.env.nas` the Synology
+# one's on this machine -- neither pattern matches the .example it came from.
 .env
+.env.nas
 
 # Project specific
 .gemini/
@@ -19,3 +23,8 @@ data/
 downloads/
 processed/
 *.part
+
+# Local-only tooling. Machine-specific by nature -- it holds addresses, accounts
+# and paths that belong to one workstation -- and no part of the project builds
+# or runs from it.
+scripts/
