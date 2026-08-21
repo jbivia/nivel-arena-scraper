@@ -28,16 +28,6 @@ The footer also carries `© SHIFT UP Corp.` and the `NIKKE` logo. Both are print
 across a set, and are not scraped. Two fields have no printed region at all and come only from the
 detail endpoint: `product_name` (제품명, the pack the card was released in) and `ip` (the franchise).
 
-## Key terms
-
-1. **Cost** (코스트) — resources needed to place the card on the field.
-2. **Power** (파워) — strength when battling other units.
-3. **Hit** (히트) — damage dealt to the opponent.
-4. **Effect** (효과) — abilities and effects.
-5. **Card Name** (카드명) and **Attribute** (속성).
-6. **Type** (종류) and **Affiliation** (소속).
-7. **ID Number** (식별 번호) and **Rarity** (레어도).
-
 ## The detail response
 
 `POST /skin/board/card_list_new/get_info.php` with `bo_table` and `wr_id` returns a UTF-8 HTML
@@ -100,11 +90,8 @@ loss. Rarity is left as-is: the codes are already Latin and the set grows with e
 
 ## Storage
 
-The fields land in the `cards` table of the same PostgreSQL database as `scraped_cards`, joined to
-it on `wr_id`. That table belongs to the sibling `nivel-arena-collection-tracker` app — its drizzle
-migrations define the shape, and this scraper only fills it. The column list is in
-[README.md](README.md#database); `main.CARD_COLUMNS` is checked against the live database at startup
-so a missing migration is reported before a scrape begins rather than halfway through one.
+The fields land in the `cards` table, keyed on `wr_id`. The column list, and who owns that table,
+are in [README.md](README.md#database).
 
 ```sql
 SELECT number, name, element, cost, power, hit, rarity, keywords
