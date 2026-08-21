@@ -16,27 +16,21 @@ A containerized Python scraper that collects high-resolution trading card images
 
 ## Project Structure
 
+Two entry points, and one compose file per deployment:
+
 ```text
-├── main.py                  # Scraper (Requests + BeautifulSoup)
-├── card_metadata.py         # Detail-response parser (no I/O)
-├── convert_to_png.py        # Image processing (OpenCV)
-├── RULES.md                 # Card layout and metadata field reference
-├── tests/                   # Test suite
-├── compose.yaml             # Development stack (Podman), satellite of the tracker
-├── compose.nas.yaml         # Standalone deployment: scraper + its own PostgreSQL
-├── compose.nas.tracker.yaml # Satellite deployment: scraper only, tracker owns the DB
-├── db/init/                 # `cards` DDL mirror, for databases no app migrates
-├── Containerfile            # Container image definition
-├── Makefile                 # Command shortcuts
-├── pyproject.toml           # Project metadata + lint/test configuration
-├── requirements.txt         # Direct runtime dependencies (edit this)
-├── requirements-dev.txt     # Direct dev/CI dependencies (edit this)
-├── requirements.lock        # Resolved + hash-pinned; what actually installs
-├── requirements-dev.lock    # Same, for the dev tree
-├── .env.example             # Connection settings template (development)
-├── .env.nas.example         # Connection settings template (Docker/Synology)
-├── downloads/               # Raw JPG downloads (host-mounted)
-└── processed/               # Transparent PNGs (host-mounted)
+main.py                   # Scraper (Requests + BeautifulSoup)
+convert_to_png.py         # Image processing (OpenCV) -- a separate invocation
+card_metadata.py          # Detail-response parser (no I/O)
+RULES.md                  # Card layout and metadata field reference
+compose.yaml              # Development stack (Podman), satellite of the tracker
+compose.nas.yaml          # Standalone deployment: scraper + its own PostgreSQL
+compose.nas.tracker.yaml  # Satellite deployment: scraper only, tracker owns the DB
+db/init/                  # `cards` DDL mirror, for databases no app migrates
+requirements*.txt         # Direct dependencies (edit these)
+requirements*.lock        # Resolved + hash-pinned; what actually installs
+downloads/                # Raw JPG downloads (host-mounted)
+processed/                # Transparent PNGs (host-mounted)
 ```
 
 ## Prerequisites
@@ -145,14 +139,16 @@ Nothing needs to be edited in source. Every setting is available as a CLI flag o
 | `SCRAPER_MIN_DELAY` | `--min-delay` | `5.0` | Minimum seconds between cards |
 | `SCRAPER_MAX_DELAY` | `--max-delay` | `10.0` | Maximum seconds between cards |
 | `SCRAPER_USER_AGENT` | — | Chrome 142 on Linux | Request `User-Agent` |
-| `SCRAPER_DOWNLOADS_DIR` | — | `/app/downloads` | Raw JPG output |
-| `SCRAPER_PROCESSED_DIR` | — | `/app/processed` | PNG output |
+| `SCRAPER_DOWNLOADS_DIR` | `--downloads-dir` ᶜ | `/app/downloads` | Raw JPG output |
+| `SCRAPER_PROCESSED_DIR` | `--processed-dir` ᶜ | `/app/processed` | PNG output |
+
+ᶜ On `convert_to_png.py`; `main.py` reads these two from the environment only.
 
 `SCRAPER_DATABASE_URL` has **no flag on purpose**: `argv` is world-readable through `/proc`, and the URL carries the password. It is read from the environment only, which under Compose means `.env` (gitignored; `make setup` seeds it from `.env.example`).
 
 The container reaches the database as `nivel-db:5432`; host-side tooling reaches the same server as `localhost:5432`. `.env.example` carries both, and the `make repair-db` / `make import-sqlite` recipes prefer `SCRAPER_DATABASE_URL_LOCAL` when it is set.
 
-Both scripts support `--help`. `main.py` also accepts `--ignore-robots` and `--verbose`; `convert_to_png.py` accepts `--workers`, `--force`, `--downloads-dir` and `--processed-dir`.
+Both scripts support `--help` and `--verbose`. `main.py` also accepts `--ignore-robots`; `convert_to_png.py` accepts `--workers` and `--force`.
 
 ### Backfilling metadata
 
