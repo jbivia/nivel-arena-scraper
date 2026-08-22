@@ -94,7 +94,7 @@ ignore = [
 ban-relative-imports = "all"
 
 [tool.ruff.lint.isort]
-known-first-party = ["card_metadata", "convert_to_png", "main", "nivel"]
+known-first-party = ["convert_to_png", "main", "nivel"]
 
 [tool.ruff.format]
 docstring-code-format = true

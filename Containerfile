@@ -30,7 +30,7 @@ RUN pip install --no-cache-dir --require-hashes -r requirements.lock
 
 # Application code stays owned by root: the unprivileged runtime user can read
 # and execute it but cannot modify it.
-COPY main.py card_metadata.py convert_to_png.py ./
+COPY main.py convert_to_png.py ./
 COPY src/ ./src/
 
 # The layered code lives under src/ and is imported as `nivel.…`. The entry

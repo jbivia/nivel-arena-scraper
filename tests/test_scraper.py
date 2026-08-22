@@ -7,7 +7,9 @@ import pytest
 import requests
 
 import main
-from main import MAX_IMAGE_BYTES, DatabaseNotConfigured, NivelArenaScraper
+from main import DatabaseNotConfigured, NivelArenaScraper
+from nivel.infrastructure.nikke.http import board_client
+from nivel.infrastructure.nikke.http.board_client import MAX_IMAGE_BYTES
 from nivel.infrastructure.persistence.connection import DATABASE_URL_ENV, redact_conninfo
 
 JPEG_BODY = b"\xff\xd8\xff\xe0" + b"\x00" * 512
@@ -16,7 +18,7 @@ JPEG_BODY = b"\xff\xd8\xff\xe0" + b"\x00" * 512
 @pytest.fixture
 def scraper(tmp_path, monkeypatch, database_url):
     # No sleeping and no robots fetch in tests.
-    monkeypatch.setattr(main.time, "sleep", lambda _: None)
+    monkeypatch.setattr(board_client.time, "sleep", lambda _: None)
     with NivelArenaScraper(
         "http://example.test",
         "cardlists",
@@ -60,12 +62,12 @@ class FakeResponse:
 
 
 def stub_get(scraper, response):
-    scraper.session.get = lambda *a, **kw: response
+    scraper.board.session.get = lambda *a, **kw: response
 
 
 def stub_request(scraper, response):
-    """Stub the session method `_fetch_soup` goes through."""
-    scraper.session.request = lambda *a, **kw: response
+    """Stub the session method `fetch_soup` goes through."""
+    scraper.board.session.request = lambda *a, **kw: response
 
 
 class TestConnectionConfig:
@@ -214,7 +216,7 @@ class TestCatalogueTableCheck:
     """`cards` belongs to the tracker app's migrations, so it is verified."""
 
     def test_missing_table_is_a_clear_error(self, tmp_path, monkeypatch, database_url_without_cards):
-        monkeypatch.setattr(main.time, "sleep", lambda _: None)
+        monkeypatch.setattr(board_client.time, "sleep", lambda _: None)
         with pytest.raises(main.CatalogueTableMissing, match="db-migrate"):
             NivelArenaScraper(
                 "http://example.test",
@@ -230,7 +232,7 @@ class TestCatalogueTableCheck:
         with psycopg.connect(database_url, connect_timeout=5, autocommit=True) as conn:
             conn.execute("ALTER TABLE cards DROP COLUMN keywords, DROP COLUMN ip")
 
-        monkeypatch.setattr(main.time, "sleep", lambda _: None)
+        monkeypatch.setattr(board_client.time, "sleep", lambda _: None)
         with pytest.raises(main.CatalogueTableMissing, match="ip, keywords"):
             NivelArenaScraper(
                 "http://example.test",
@@ -247,12 +249,12 @@ class TestBackfillMetadata:
         def fake_details(wr_id):
             if seen is not None:
                 seen.append(wr_id)
-            return main.BeautifulSoup(
+            return board_client.BeautifulSoup(
                 f"<h2 id='subject'>카드 {wr_id}</h2><h2 id='type'>BT06-00{wr_id} / 유닛 / 화염</h2>",
                 "html.parser",
             )
 
-        monkeypatch.setattr(scraper, "get_card_details", fake_details)
+        monkeypatch.setattr(scraper.board, "get_card_details", fake_details)
 
     def test_dry_run_makes_no_requests_and_writes_nothing(self, scraper, monkeypatch):
         scraper.mark_as_scraped("1", "BT06-001", "BT06-001.jpg")
@@ -260,7 +262,7 @@ class TestBackfillMetadata:
         def explode(wr_id):
             raise AssertionError("a dry run must not hit the network")
 
-        monkeypatch.setattr(scraper, "get_card_details", explode)
+        monkeypatch.setattr(scraper.board, "get_card_details", explode)
         assert scraper.backfill_metadata(dry_run=True) == (1, 0)
         assert scraper._conn.execute("SELECT count(*) FROM cards").fetchone() == (0,)
 
@@ -305,11 +307,11 @@ class TestBackfillMetadata:
         def flaky(wr_id):
             if wr_id == "1":
                 raise requests.ConnectionError("transient")
-            return main.BeautifulSoup(
+            return board_client.BeautifulSoup(
                 "<h2 id='subject'>카드 2</h2><h2 id='type'>BT06-002 / 유닛 / 화염</h2>", "html.parser"
             )
 
-        monkeypatch.setattr(scraper, "get_card_details", flaky)
+        monkeypatch.setattr(scraper.board, "get_card_details", flaky)
         assert scraper.backfill_metadata(dry_run=False) == (1, 1)
 
     def test_gives_up_after_consecutive_failures(self, scraper, monkeypatch):
@@ -322,7 +324,7 @@ class TestBackfillMetadata:
             attempts.append(wr_id)
             raise requests.ConnectionError("down")
 
-        monkeypatch.setattr(scraper, "get_card_details", always_fails)
+        monkeypatch.setattr(scraper.board, "get_card_details", always_fails)
         assert scraper.backfill_metadata(dry_run=False) == (0, main.MAX_CONSECUTIVE_PAGE_FAILURES)
         assert len(attempts) == main.MAX_CONSECUTIVE_PAGE_FAILURES
 
@@ -341,7 +343,9 @@ class TestScrapeCardStoresMetadata:
 
     def test_metadata_lands_alongside_the_image(self, scraper, monkeypatch):
         monkeypatch.setattr(
-            scraper, "get_card_details", lambda wr_id: main.BeautifulSoup(self._detail_html(), "html.parser")
+            scraper.board,
+            "get_card_details",
+            lambda wr_id: board_client.BeautifulSoup(self._detail_html(), "html.parser"),
         )
         stub_get(scraper, FakeResponse())
         scraper.scrape_card("1", "remote.jpg")
@@ -354,7 +358,9 @@ class TestScrapeCardStoresMetadata:
 
     def test_unparseable_details_still_download_the_image(self, scraper, monkeypatch):
         monkeypatch.setattr(
-            scraper, "get_card_details", lambda wr_id: main.BeautifulSoup("<html></html>", "html.parser")
+            scraper.board,
+            "get_card_details",
+            lambda wr_id: board_client.BeautifulSoup("<html></html>", "html.parser"),
         )
         stub_get(scraper, FakeResponse())
         scraper.scrape_card("1", "remote.jpg")
@@ -365,7 +371,9 @@ class TestScrapeCardStoresMetadata:
 
     def test_a_failed_download_stores_no_metadata(self, scraper, monkeypatch):
         monkeypatch.setattr(
-            scraper, "get_card_details", lambda wr_id: main.BeautifulSoup(self._detail_html(), "html.parser")
+            scraper.board,
+            "get_card_details",
+            lambda wr_id: board_client.BeautifulSoup(self._detail_html(), "html.parser"),
         )
         stub_get(scraper, FakeResponse(body=b"<html>404</html>"))
         scraper.scrape_card("1", "remote.jpg")
@@ -411,53 +419,53 @@ class TestImportSqliteHistory:
 class TestDownloadImage:
     def test_saves_file_and_returns_name(self, scraper):
         stub_get(scraper, FakeResponse())
-        assert scraper.download_image("http://example.test/a.jpg", "BT06-001.jpg") == "BT06-001.jpg"
-        assert (scraper.downloads_dir / "BT06-001.jpg").read_bytes() == JPEG_BODY
+        assert scraper.board.download_image("http://example.test/a.jpg", "BT06-001.jpg") == "BT06-001.jpg"
+        assert (scraper.board.downloads_dir / "BT06-001.jpg").read_bytes() == JPEG_BODY
 
     def test_deduplicates_existing_filename(self, scraper):
-        (scraper.downloads_dir / "BT06-001.jpg").write_bytes(b"old")
+        (scraper.board.downloads_dir / "BT06-001.jpg").write_bytes(b"old")
         stub_get(scraper, FakeResponse())
-        assert scraper.download_image("http://example.test/a.jpg", "BT06-001.jpg") == "BT06-001-01.jpg"
-        assert (scraper.downloads_dir / "BT06-001.jpg").read_bytes() == b"old"
+        assert scraper.board.download_image("http://example.test/a.jpg", "BT06-001.jpg") == "BT06-001-01.jpg"
+        assert (scraper.board.downloads_dir / "BT06-001.jpg").read_bytes() == b"old"
 
     def test_rejects_cross_host_redirect(self, scraper):
         stub_get(scraper, FakeResponse(url="http://evil.test/a.jpg"))
-        assert scraper.download_image("http://example.test/a.jpg", "x.jpg") is None
-        assert list(scraper.downloads_dir.iterdir()) == []
+        assert scraper.board.download_image("http://example.test/a.jpg", "x.jpg") is None
+        assert list(scraper.board.downloads_dir.iterdir()) == []
 
     def test_rejects_non_image_content_type(self, scraper):
         stub_get(scraper, FakeResponse(headers={"Content-Type": "text/html; charset=utf-8"}))
-        assert scraper.download_image("http://example.test/a.jpg", "x.jpg") is None
-        assert list(scraper.downloads_dir.iterdir()) == []
+        assert scraper.board.download_image("http://example.test/a.jpg", "x.jpg") is None
+        assert list(scraper.board.downloads_dir.iterdir()) == []
 
     def test_rejects_html_body_masquerading_as_image(self, scraper):
         stub_get(scraper, FakeResponse(body=b"<html>404 not found</html>"))
-        assert scraper.download_image("http://example.test/a.jpg", "x.jpg") is None
-        assert list(scraper.downloads_dir.iterdir()) == []
+        assert scraper.board.download_image("http://example.test/a.jpg", "x.jpg") is None
+        assert list(scraper.board.downloads_dir.iterdir()) == []
 
     def test_rejects_oversized_declared_length(self, scraper):
         stub_get(
             scraper,
             FakeResponse(headers={"Content-Type": "image/jpeg", "Content-Length": str(MAX_IMAGE_BYTES + 1)}),
         )
-        assert scraper.download_image("http://example.test/a.jpg", "x.jpg") is None
+        assert scraper.board.download_image("http://example.test/a.jpg", "x.jpg") is None
 
     def test_rejects_body_exceeding_cap_without_content_length(self, scraper, monkeypatch):
-        monkeypatch.setattr(main, "MAX_IMAGE_BYTES", 1024)
+        monkeypatch.setattr(board_client, "MAX_IMAGE_BYTES", 1024)
         big = b"\xff\xd8\xff" + b"\x00" * 4096
         stub_get(scraper, FakeResponse(body=big, headers={"Content-Type": "image/jpeg"}))
-        assert scraper.download_image("http://example.test/a.jpg", "x.jpg") is None
+        assert scraper.board.download_image("http://example.test/a.jpg", "x.jpg") is None
         # Nothing partial is left behind.
-        assert list(scraper.downloads_dir.iterdir()) == []
+        assert list(scraper.board.downloads_dir.iterdir()) == []
 
     def test_rejects_empty_body(self, scraper):
         stub_get(scraper, FakeResponse(body=b"", headers={"Content-Type": "image/jpeg"}))
-        assert scraper.download_image("http://example.test/a.jpg", "x.jpg") is None
+        assert scraper.board.download_image("http://example.test/a.jpg", "x.jpg") is None
 
     def test_leaves_no_part_file_on_failure(self, scraper):
         stub_get(scraper, FakeResponse(body=b"<html>nope</html>"))
-        scraper.download_image("http://example.test/a.jpg", "x.jpg")
-        assert not any(p.name.endswith(".part") for p in scraper.downloads_dir.iterdir())
+        scraper.board.download_image("http://example.test/a.jpg", "x.jpg")
+        assert not any(p.name.endswith(".part") for p in scraper.board.downloads_dir.iterdir())
 
 
 class TestFetchSoup:
@@ -469,43 +477,43 @@ class TestFetchSoup:
 
     def test_parses_a_normal_page(self, scraper):
         stub_request(scraper, self._html("<div id='subject'>누아르</div>".encode()))
-        soup = scraper.get_html("http://example.test/bbs/board.php")
+        soup = scraper.board.get_html("http://example.test/bbs/board.php")
         assert soup.select_one("#subject").get_text() == "누아르"
 
     def test_rejects_off_host_redirect(self, scraper):
         stub_request(scraper, self._html(b"<html>hi</html>", url="http://evil.test/p"))
-        with pytest.raises(main.OffHostRedirect):
-            scraper.get_html("http://example.test/bbs/board.php")
+        with pytest.raises(board_client.OffHostRedirect):
+            scraper.board.get_html("http://example.test/bbs/board.php")
 
     def test_detail_endpoint_rejects_off_host_redirect(self, scraper):
         stub_request(scraper, self._html(b"<html>hi</html>", url="http://evil.test/p"))
-        with pytest.raises(main.OffHostRedirect):
-            scraper.get_card_details("1")
+        with pytest.raises(board_client.OffHostRedirect):
+            scraper.board.get_card_details("1")
 
     def test_rejects_oversized_body(self, scraper, monkeypatch):
-        monkeypatch.setattr(main, "MAX_HTML_BYTES", 1024)
+        monkeypatch.setattr(board_client, "MAX_HTML_BYTES", 1024)
         stub_request(scraper, self._html(b"<p>x</p>" * 4096))
-        with pytest.raises(main.ResponseTooLarge):
-            scraper.get_html("http://example.test/bbs/board.php")
+        with pytest.raises(board_client.ResponseTooLarge):
+            scraper.board.get_html("http://example.test/bbs/board.php")
 
     def test_undeclared_charset_does_not_mangle_korean(self, scraper):
         # requests would decode a text/* body with no charset as ISO-8859-1.
         body = "<meta charset='utf-8'><div id='subject'>누아르</div>".encode()
         stub_request(scraper, self._html(body, content_type="text/html"))
-        soup = scraper.get_html("http://example.test/bbs/board.php")
+        soup = scraper.board.get_html("http://example.test/bbs/board.php")
         assert soup.select_one("#subject").get_text() == "누아르"
 
     def test_declared_charset_is_honoured(self, scraper):
         body = "<div id='subject'>누아르</div>".encode("euc-kr")
         stub_request(scraper, self._html(body, content_type="text/html; charset=euc-kr"))
-        soup = scraper.get_html("http://example.test/bbs/board.php")
+        soup = scraper.board.get_html("http://example.test/bbs/board.php")
         assert soup.select_one("#subject").get_text() == "누아르"
 
     def test_a_nonsense_declared_charset_does_not_break_parsing(self, scraper):
         # The header is attacker-controlled on an unauthenticated hop.
         body = "<div id='subject'>누아르</div>".encode()
         stub_request(scraper, self._html(body, content_type="text/html; charset=not-a-charset"))
-        soup = scraper.get_html("http://example.test/bbs/board.php")
+        soup = scraper.board.get_html("http://example.test/bbs/board.php")
         assert soup.select_one("#subject").get_text() == "누아르"
 
 
@@ -516,12 +524,12 @@ class TestRobots:
 
     def test_a_disallowed_detail_endpoint_stops_the_board_walk(self, scraper, monkeypatch):
         # Every card goes through it, so there is nothing to walk without it.
-        scraper._robots = self._Disallowing()
+        scraper.board.robots = self._Disallowing()
 
         def explode(url):
             raise AssertionError("no page should be fetched")
 
-        monkeypatch.setattr(scraper, "get_html", explode)
+        monkeypatch.setattr(scraper.board, "get_html", explode)
         scraper.scrape_board()
 
 
@@ -537,7 +545,7 @@ class TestEnvironmentSettings:
 
 class TestRepairFilenames:
     def test_repairs_unique_match(self, scraper):
-        (scraper.downloads_dir / "BT06-037.jpg").write_bytes(JPEG_BODY)
+        (scraper.board.downloads_dir / "BT06-037.jpg").write_bytes(JPEG_BODY)
         scraper.mark_as_scraped("1065", "BT06-037", "source_hash_abc.jpg")
 
         scraper.repair_filenames(dry_run=False)
@@ -548,7 +556,7 @@ class TestRepairFilenames:
         assert stored == "BT06-037.jpg"
 
     def test_dry_run_changes_nothing(self, scraper):
-        (scraper.downloads_dir / "BT06-037.jpg").write_bytes(JPEG_BODY)
+        (scraper.board.downloads_dir / "BT06-037.jpg").write_bytes(JPEG_BODY)
         scraper.mark_as_scraped("1065", "BT06-037", "source_hash_abc.jpg")
 
         repaired, _, _ = scraper.repair_filenames(dry_run=True)
@@ -560,8 +568,8 @@ class TestRepairFilenames:
         assert stored == "source_hash_abc.jpg"
 
     def test_leaves_ambiguous_variants_alone(self, scraper):
-        (scraper.downloads_dir / "BT06-037.jpg").write_bytes(JPEG_BODY)
-        (scraper.downloads_dir / "BT06-037-01.jpg").write_bytes(JPEG_BODY)
+        (scraper.board.downloads_dir / "BT06-037.jpg").write_bytes(JPEG_BODY)
+        (scraper.board.downloads_dir / "BT06-037-01.jpg").write_bytes(JPEG_BODY)
         scraper.mark_as_scraped("1065", "BT06-037", "source_hash_abc.jpg")
 
         repaired, ambiguous, _ = scraper.repair_filenames(dry_run=False)
@@ -569,7 +577,7 @@ class TestRepairFilenames:
         assert (repaired, ambiguous) == (0, 1)
 
     def test_does_not_double_claim_a_file(self, scraper):
-        (scraper.downloads_dir / "BT06-037.jpg").write_bytes(JPEG_BODY)
+        (scraper.board.downloads_dir / "BT06-037.jpg").write_bytes(JPEG_BODY)
         scraper.mark_as_scraped("1065", "BT06-037", "BT06-037.jpg")  # already correct
         scraper.mark_as_scraped("1066", "BT06-037", "source_hash_abc.jpg")
 
@@ -584,9 +592,9 @@ class TestScrapeBoard:
 
         def fake_get_html(url):
             pages.append(url)
-            return main.BeautifulSoup("<html><body></body></html>", "html.parser")
+            return board_client.BeautifulSoup("<html><body></body></html>", "html.parser")
 
-        monkeypatch.setattr(scraper, "get_html", fake_get_html)
+        monkeypatch.setattr(scraper.board, "get_html", fake_get_html)
         scraper.scrape_board()
         assert len(pages) == 1
 
@@ -597,7 +605,7 @@ class TestScrapeBoard:
             attempts.append(url)
             raise requests.ConnectionError("boom")
 
-        monkeypatch.setattr(scraper, "get_html", always_fails)
+        monkeypatch.setattr(scraper.board, "get_html", always_fails)
         scraper.scrape_board()
         assert len(attempts) == main.MAX_CONSECUTIVE_PAGE_FAILURES
 
@@ -608,15 +616,17 @@ class TestScrapeBoard:
             calls["n"] += 1
             if calls["n"] == 1:
                 raise requests.ConnectionError("transient")
-            return main.BeautifulSoup("<html></html>", "html.parser")
+            return board_client.BeautifulSoup("<html></html>", "html.parser")
 
-        monkeypatch.setattr(scraper, "get_html", flaky)
+        monkeypatch.setattr(scraper.board, "get_html", flaky)
         scraper.scrape_board()
         assert calls["n"] == 2  # recovered and then hit the empty-page stop
 
     def test_respects_max_pages(self, scraper, monkeypatch):
         html = '<div class="gall_img"><a href="f.jpg♬1"></a></div>'
-        monkeypatch.setattr(scraper, "get_html", lambda url: main.BeautifulSoup(html, "html.parser"))
+        monkeypatch.setattr(
+            scraper.board, "get_html", lambda url: board_client.BeautifulSoup(html, "html.parser")
+        )
         monkeypatch.setattr(scraper, "scrape_card", lambda *a: None)
         scraper.mark_as_scraped("1", "x", "x.jpg")  # so nothing is downloaded
         scraper.scrape_board(max_pages=2)  # must terminate
@@ -624,7 +634,9 @@ class TestScrapeBoard:
     def test_skips_already_scraped(self, scraper, monkeypatch):
         html = '<div class="gall_img"><a href="f.jpg♬1"></a></div>'
         seen = []
-        monkeypatch.setattr(scraper, "get_html", lambda url: main.BeautifulSoup(html, "html.parser"))
+        monkeypatch.setattr(
+            scraper.board, "get_html", lambda url: board_client.BeautifulSoup(html, "html.parser")
+        )
         monkeypatch.setattr(scraper, "scrape_card", lambda wr_id, fn: seen.append(wr_id))
         scraper.mark_as_scraped("1", "x", "x.jpg")
         scraper.scrape_board(max_pages=1)

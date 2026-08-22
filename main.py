@@ -1,8 +1,9 @@
 """Scrape trading card images and metadata from a GnuBoard5 card board.
 
-The target site is served over plaintext HTTP only (it has no TLS listener), so
-every response has to be treated as untrusted input: sizes are capped, content
-types are checked, and cross-host redirects are refused.
+This module is the composition root: it opens the connection, wires the
+repositories to the board client and drives them. The pieces themselves live
+under ``nivel`` -- HTTP in ``infrastructure.nikke.http``, SQL in
+``infrastructure.nikke.persistence``, the rules in ``domain.nikke``.
 
 Two tables are written. ``scraped_cards`` is the scraper's own and tracks what
 has been downloaded. ``cards`` is the catalogue the sibling
@@ -16,24 +17,18 @@ the URL carries the password.
 import argparse
 import logging
 import os
-import random
 import re
 import sqlite3
-import time
 from pathlib import Path
-from urllib.parse import quote, urlparse
-from urllib.robotparser import RobotFileParser
+from urllib.parse import quote
 
 import psycopg
-import requests
-from bs4 import BeautifulSoup
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
-import card_metadata
 from nivel.domain.nikke.entity.card import Card
 from nivel.domain.nikke.exception.catalogue import CatalogueTableMissing, DatabaseNotConfigured
 from nivel.domain.nikke.value_object.card_naming import parse_card_link, safe_stem
+from nivel.infrastructure.nikke.http.board_client import BoardClient
+from nivel.infrastructure.nikke.parsing import card_metadata
 from nivel.infrastructure.nikke.persistence.postgres_card_repository import PostgresCardRepository
 from nivel.infrastructure.nikke.persistence.postgres_scrape_history_repository import (
     PostgresScrapeHistoryRepository,
@@ -44,48 +39,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 log = logging.getLogger("scraper")
 
 
-# (connect, read) timeouts. Without these a half-open socket hangs the run
-# forever -- urllib3's Retry only covers responses, never a stalled read.
-REQUEST_TIMEOUT = (10, 30)
-
-# Hard ceiling on a single download. The largest observed card is ~200 KB;
-# 32 MB leaves generous headroom while bounding a hostile/broken response.
-MAX_IMAGE_BYTES = 32 * 1024 * 1024
-DOWNLOAD_CHUNK_SIZE = 65536
-
-# Same idea for HTML. A board page is ~50 KB and a detail fragment a few KB, so
-# 8 MB never refuses a real response while keeping a hostile one from being
-# read into memory in full.
-MAX_HTML_BYTES = 8 * 1024 * 1024
-
-# Charset out of a Content-Type header, e.g. 'text/html; charset=utf-8'.
-_CHARSET_RE = re.compile(r"charset=([\w.:-]+)", re.IGNORECASE)
-
-# Jitter around a list-page fetch. Shorter than the per-card delay: one page
-# yields many cards, each of which is already rate-limited on its own.
-LIST_PAGE_DELAY = (2.0, 5.0)
-
-# JPEG SOI marker. Guards against an HTML error page served with a 200.
-JPEG_MAGIC = b"\xff\xd8\xff"
-
-DEFAULT_RETRY = Retry(
-    total=3,
-    backoff_factor=2,
-    status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=["GET", "POST"],
-)
-
 # Give up on a board after this many consecutive page failures rather than
 # aborting the whole run on the first transient error.
 MAX_CONSECUTIVE_PAGE_FAILURES = 3
-
-
-class OffHostRedirect(RuntimeError):
-    """Raised when a response came from a host other than the configured board."""
-
-
-class ResponseTooLarge(RuntimeError):
-    """Raised when a response body exceeded its size cap."""
 
 
 class NivelArenaScraper:
@@ -100,39 +56,13 @@ class NivelArenaScraper:
         obey_robots=True,
         user_agent=None,
     ):
-        self.base_url = base_url.rstrip("/")
-        self.board_id = board_id
-        self.ajax_url = f"{self.base_url}/skin/board/card_list_new/get_info.php"
-        self.base_host = urlparse(self.base_url).netloc
-        self.min_delay = min_delay
-        self.max_delay = max_delay
-
         self.database_url = resolve_database_url(database_url)
-
-        self.downloads_dir = Path(downloads_dir or os.environ.get("SCRAPER_DOWNLOADS_DIR", "/app/downloads"))
-        self.downloads_dir.mkdir(parents=True, exist_ok=True)
 
         self._conn = connect(self.database_url)
         self._cards = PostgresCardRepository(self._conn)
         self._history = PostgresScrapeHistoryRepository(self._conn)
 
-        self.session = requests.Session()
-        adapter = HTTPAdapter(max_retries=DEFAULT_RETRY)
-        self.session.mount("http://", adapter)
-        self.session.mount("https://", adapter)
-        self.session.headers.update(
-            {
-                "User-Agent": user_agent
-                or os.environ.get(
-                    "SCRAPER_USER_AGENT",
-                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
-                ),
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                "image/avif,image/webp,*/*;q=0.8",
-                "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
-            }
-        )
+        self.board = None
 
         # Anything that can fail goes here, behind a cleanup: the caller of a
         # constructor that raised never receives an object to close, so a
@@ -140,7 +70,15 @@ class NivelArenaScraper:
         # against the database the tracker app is also using.
         try:
             self._init_db()
-            self._robots = self._load_robots() if obey_robots else None
+            self.board = BoardClient(
+                base_url,
+                board_id,
+                downloads_dir=downloads_dir,
+                min_delay=min_delay,
+                max_delay=max_delay,
+                obey_robots=obey_robots,
+                user_agent=user_agent,
+            )
         except BaseException:
             self.close()
             raise
@@ -158,45 +96,9 @@ class NivelArenaScraper:
         if conn is not None:
             conn.close()
 
-        session, self.session = self.session, None
-        if session is not None:
-            session.close()
-
-    def _polite_sleep(self, low, high):
-        """Pause for a jittered interval so requests are never evenly spaced."""
-        delay = random.uniform(low, high)  # noqa: S311 - politeness jitter, not a secret
-        log.info("Sleeping %.2fs to respect rate limits...", delay)
-        time.sleep(delay)
-
-    # --- robots -----------------------------------------------------------
-
-    def _load_robots(self):
-        """Fetch robots.txt. A missing file means 'no restrictions'."""
-        parser = RobotFileParser()
-        robots_url = f"{self.base_url}/robots.txt"
-        try:
-            response = self.session.get(robots_url, timeout=REQUEST_TIMEOUT)
-        except requests.RequestException as exc:
-            log.warning("Could not fetch %s (%s); proceeding without robots rules.", robots_url, exc)
-            return None
-
-        if response.status_code >= 400:
-            log.info(
-                "No robots.txt at %s (HTTP %s); no crawl restrictions.", robots_url, response.status_code
-            )
-            parser.parse([])
-        else:
-            parser.parse(response.text.splitlines())
-        return parser
-
-    def _may_fetch(self, url):
-        if self._robots is None:
-            return True
-        agent = self.session.headers.get("User-Agent", "*")
-        allowed = self._robots.can_fetch(agent, url)
-        if not allowed:
-            log.warning("robots.txt disallows %s -- skipping.", url)
-        return allowed
+        board, self.board = self.board, None
+        if board is not None:
+            board.close()
 
     # --- database ---------------------------------------------------------
 
@@ -220,144 +122,14 @@ class NivelArenaScraper:
         """Store one parsed card. Returns whether it landed."""
         return self._cards.upsert(Card.from_details(wr_id, details, image_filename))
 
-    # --- http -------------------------------------------------------------
-
-    def _fetch_soup(self, method, url, **kwargs):
-        """Fetch one HTML document from the board and parse it.
-
-        Streamed and capped rather than read in one go: ``response.text`` pulls
-        the whole body into memory before anything can object to its size, and
-        over plaintext HTTP the length is whatever the wire says it is. The
-        final host is re-checked for the same reason downloads check it --
-        a redirect is trivially injected on an unauthenticated hop.
-        """
-        with self.session.request(method, url, stream=True, timeout=REQUEST_TIMEOUT, **kwargs) as response:
-            response.raise_for_status()
-
-            final_host = urlparse(response.url).netloc
-            if final_host != self.base_host:
-                raise OffHostRedirect(f"{url} redirected off-host to {response.url}")
-
-            body = bytearray()
-            for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
-                body += chunk
-                if len(body) > MAX_HTML_BYTES:
-                    raise ResponseTooLarge(f"{url} body exceeded {MAX_HTML_BYTES} bytes")
-
-            declared = _CHARSET_RE.search(response.headers.get("Content-Type", ""))
-
-        # Handed over as bytes: requests decodes an undeclared text/* body as
-        # ISO-8859-1 per the HTTP spec, which would mangle the Korean this board
-        # is written in. BeautifulSoup reads the meta charset instead.
-        return BeautifulSoup(
-            bytes(body), "html.parser", from_encoding=declared.group(1) if declared else None
-        )
-
-    def get_html(self, url):
-        log.info("Fetching list page: %s", url)
-        self._polite_sleep(*LIST_PAGE_DELAY)
-        return self._fetch_soup("GET", url)
-
-    def get_card_details(self, wr_id):
-        payload = {"bo_table": self.board_id, "wr_id": wr_id}
-        # Per-request headers; session-level headers are merged automatically,
-        # so this never mutates shared session state.
-        headers = {
-            "X-Requested-With": "XMLHttpRequest",
-            "Referer": f"{self.base_url}/bbs/board.php?bo_table={self.board_id}",
-        }
-
-        log.info("Fetching details for wr_id %s", wr_id)
-        return self._fetch_soup("POST", self.ajax_url, data=payload, headers=headers)
-
-    def _reserve_filename(self, filename):
-        """Return an unused path for ``filename``, suffixing -01..-99 on clash."""
-        filepath = self.downloads_dir / filename
-        if not filepath.exists():
-            return filepath
-
-        for i in range(1, 100):
-            candidate = self.downloads_dir / f"{filepath.stem}-{i:02d}{filepath.suffix}"
-            if not candidate.exists():
-                log.info("Duplicate found. Saving %s as %s", filename, candidate.name)
-                return candidate
-
-        log.error("No available filename for %s after 99 attempts.", filename)
-        return None
-
-    def download_image(self, img_url, filename):
-        """Download an image and return the saved filename, or None on failure."""
-        if not self._may_fetch(img_url):
-            return None
-
-        filepath = self._reserve_filename(filename)
-        if filepath is None:
-            return None
-
-        log.info("Downloading %s -> %s", img_url, filepath.name)
-        # Redirects are followed, but the final host must still be the board's:
-        # over plaintext HTTP a hop can be injected, and we will not stream an
-        # unbounded body from wherever it points.
-        with self.session.get(
-            img_url, stream=True, timeout=REQUEST_TIMEOUT, allow_redirects=True
-        ) as response:
-            response.raise_for_status()
-
-            final_host = urlparse(response.url).netloc
-            if final_host != self.base_host:
-                log.error("Refusing cross-host redirect: %s -> %s", img_url, response.url)
-                return None
-
-            content_type = response.headers.get("Content-Type", "").split(";")[0].strip().lower()
-            if not content_type.startswith("image/"):
-                log.error("Refusing non-image response for %s (Content-Type: %r)", img_url, content_type)
-                return None
-
-            declared = response.headers.get("Content-Length")
-            if declared and declared.isdigit() and int(declared) > MAX_IMAGE_BYTES:
-                log.error(
-                    "Refusing %s: declared size %s exceeds %d bytes", img_url, declared, MAX_IMAGE_BYTES
-                )
-                return None
-
-            # Stream to a sibling .part file and rename only on success, so an
-            # interrupted download never leaves a truncated .jpg behind that a
-            # later run would mistake for a completed one.
-            tmp_path = filepath.with_name(filepath.name + ".part")
-            written = 0
-            try:
-                with tmp_path.open("wb") as handle:
-                    for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
-                        if not chunk:
-                            continue
-                        if written == 0 and not chunk.startswith(JPEG_MAGIC):
-                            log.error("Refusing %s: payload is not a JPEG.", img_url)
-                            return None
-                        written += len(chunk)
-                        if written > MAX_IMAGE_BYTES:
-                            log.error("Refusing %s: body exceeded %d bytes.", img_url, MAX_IMAGE_BYTES)
-                            return None
-                        handle.write(chunk)
-
-                if written == 0:
-                    log.error("Refusing %s: empty response body.", img_url)
-                    return None
-
-                tmp_path.replace(filepath)
-            finally:
-                tmp_path.unlink(missing_ok=True)
-
-        time.sleep(1)
-        return filepath.name
-
     # --- orchestration ----------------------------------------------------
 
     def scrape_board(self, max_pages=None):
         # Every card goes through the detail endpoint, so a board walk that is
         # not allowed to call it has nothing to do. Asked once here rather than
         # once per card, as the backfill does.
-        if not self._may_fetch(self.ajax_url):
-            log.error("robots.txt disallows the detail endpoint %s; nothing to scrape.", self.ajax_url)
+        if not self.board.may_fetch(self.board.ajax_url):
+            log.error("robots.txt disallows the detail endpoint %s; nothing to scrape.", self.board.ajax_url)
             return
 
         page = 1
@@ -367,12 +139,12 @@ class NivelArenaScraper:
             if max_pages is not None and page > max_pages:
                 break
 
-            list_url = f"{self.base_url}/bbs/board.php?bo_table={self.board_id}&page={page}"
-            if not self._may_fetch(list_url):
+            list_url = self.board.list_page_url(page)
+            if not self.board.may_fetch(list_url):
                 break
 
             try:
-                soup = self.get_html(list_url)
+                soup = self.board.get_html(list_url)
             except Exception as exc:
                 consecutive_failures += 1
                 log.error(
@@ -406,13 +178,13 @@ class NivelArenaScraper:
                     continue
 
                 self.scrape_card(wr_id, img_filename)
-                self._polite_sleep(self.min_delay, self.max_delay)
+                self.board.sleep_between_cards()
 
             page += 1
 
     def scrape_card(self, wr_id, img_filename):
         try:
-            detail_soup = self.get_card_details(wr_id)
+            detail_soup = self.board.get_card_details(wr_id)
         except Exception as exc:
             log.error("Failed to retrieve details for wr_id %s: %s", wr_id, exc)
             return
@@ -429,12 +201,10 @@ class NivelArenaScraper:
         if details and details["card_number"]:
             card_id = safe_stem(details["card_number"], fallback=f"unknown_{wr_id}")
 
-        # quote() keeps a hostile filename from injecting query/fragment parts
-        # into the URL; parse_card_link has already rejected path separators.
-        full_src = f"{self.base_url}/data/file/{self.board_id}/{quote(img_filename, safe='')}"
+        full_src = self.board.image_url(img_filename)
 
         try:
-            actual_filename = self.download_image(full_src, f"{card_id}.jpg")
+            actual_filename = self.board.download_image(full_src, f"{card_id}.jpg")
         except Exception as exc:
             log.error("Failed to download %s: %s", full_src, exc)
             return
@@ -475,17 +245,17 @@ class NivelArenaScraper:
 
         # One robots check for the endpoint, rather than the same question 500
         # times over.
-        if not self._may_fetch(self.ajax_url):
+        if not self.board.may_fetch(self.board.ajax_url):
             log.error("robots.txt disallows the detail endpoint; nothing to do.")
             return 0, 0
 
         processed, failures, consecutive_failures = 0, 0, 0
         for index, (wr_id, image_filename) in enumerate(rows):
             if index:
-                self._polite_sleep(self.min_delay, self.max_delay)
+                self.board.sleep_between_cards()
 
             try:
-                details = card_metadata.parse_card_details(self.get_card_details(wr_id))
+                details = card_metadata.parse_card_details(self.board.get_card_details(wr_id))
             except Exception as exc:
                 failures += 1
                 consecutive_failures += 1
@@ -523,7 +293,7 @@ class NivelArenaScraper:
         """
         rows = self._history.all_entries()
 
-        on_disk = {p.name for p in self.downloads_dir.glob("*.jpg")}
+        on_disk = {p.name for p in self.board.downloads_dir.glob("*.jpg")}
         claimed = {name for _, _, name in rows if name in on_disk}
 
         repaired, ambiguous, unresolved = 0, 0, 0
