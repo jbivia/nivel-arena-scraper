@@ -8,6 +8,8 @@ import requests
 
 import main
 from main import DatabaseNotConfigured, NivelArenaScraper
+from nivel.application.nikke.failure_policy import MAX_CONSECUTIVE_PAGE_FAILURES
+from nivel.domain.nikke.entity.card import Card
 from nivel.infrastructure.nikke.http import board_client
 from nivel.infrastructure.nikke.http.board_client import MAX_IMAGE_BYTES
 from nivel.infrastructure.persistence.connection import DATABASE_URL_ENV, redact_conninfo
@@ -97,23 +99,23 @@ class TestConnectionConfig:
 
 class TestDatabase:
     def test_round_trip(self, scraper):
-        assert not scraper.is_already_scraped("1")
-        scraper.mark_as_scraped("1", "BT06-001", "BT06-001.jpg")
-        assert scraper.is_already_scraped("1")
+        assert not scraper.history.is_already_scraped("1")
+        scraper.history.mark_as_scraped("1", "BT06-001", "BT06-001.jpg")
+        assert scraper.history.is_already_scraped("1")
 
     def test_duplicate_insert_does_not_raise(self, scraper):
-        scraper.mark_as_scraped("1", "BT06-001", "BT06-001.jpg")
-        scraper.mark_as_scraped("1", "BT06-001", "BT06-001-01.jpg")  # must not raise
+        scraper.history.mark_as_scraped("1", "BT06-001", "BT06-001.jpg")
+        scraper.history.mark_as_scraped("1", "BT06-001", "BT06-001-01.jpg")  # must not raise
         rows = scraper._conn.execute("SELECT image_filename FROM scraped_cards").fetchall()
         assert rows == [("BT06-001.jpg",)]
 
     def test_init_is_idempotent(self, scraper):
-        scraper.mark_as_scraped("1", "BT06-001", "BT06-001.jpg")
+        scraper.history.mark_as_scraped("1", "BT06-001", "BT06-001.jpg")
         scraper._init_db()  # CREATE TABLE IF NOT EXISTS must not drop anything
-        assert scraper.is_already_scraped("1")
+        assert scraper.history.is_already_scraped("1")
 
     def test_rows_are_timestamped(self, scraper):
-        scraper.mark_as_scraped("1", "BT06-001", "BT06-001.jpg")
+        scraper.history.mark_as_scraped("1", "BT06-001", "BT06-001.jpg")
         stamped = scraper._conn.execute(
             "SELECT scraped_at IS NOT NULL FROM scraped_cards WHERE wr_id = '1'"
         ).fetchone()[0]
@@ -146,7 +148,7 @@ def details(**overrides):
 
 class TestCardCatalogue:
     def test_stores_every_field(self, scraper):
-        scraper.upsert_card("1", details(), "BT06-001.jpg")
+        scraper.cards.upsert(Card.from_details("1", details(), "BT06-001.jpg"))
         row = scraper._conn.execute(
             "SELECT number, set_code, name, type, type_en, element, element_en,"
             " cost, power, hit, rarity, affiliation, keywords, effect, product_name, ip,"
@@ -173,34 +175,36 @@ class TestCardCatalogue:
         )
 
     def test_nulls_survive_the_round_trip(self, scraper):
-        scraper.upsert_card("1", details(power=None, hit=None, affiliation=[], keywords=[]))
+        scraper.cards.upsert(
+            Card.from_details("1", details(power=None, hit=None, affiliation=[], keywords=[]))
+        )
         row = scraper._conn.execute(
             "SELECT power, hit, affiliation, keywords, image_filename FROM cards WHERE wr_id = '1'"
         ).fetchone()
         assert row == (None, None, [], [], None)
 
     def test_reupsert_refreshes_the_row(self, scraper):
-        scraper.upsert_card("1", details(), "BT06-001.jpg")
-        scraper.upsert_card("1", details(power=3000, effect="새 효과."), "BT06-001.jpg")
+        scraper.cards.upsert(Card.from_details("1", details(), "BT06-001.jpg"))
+        scraper.cards.upsert(Card.from_details("1", details(power=3000, effect="새 효과."), "BT06-001.jpg"))
         rows = scraper._conn.execute("SELECT power, effect FROM cards").fetchall()
         assert rows == [(3000, "새 효과.")]
 
     def test_backfill_does_not_blank_a_known_filename(self, scraper):
-        scraper.upsert_card("1", details(), "BT06-001.jpg")
-        scraper.upsert_card("1", details(), None)  # a backfill that knows no filename
+        scraper.cards.upsert(Card.from_details("1", details(), "BT06-001.jpg"))
+        scraper.cards.upsert(Card.from_details("1", details(), None))  # a backfill that knows no filename
         stored = scraper._conn.execute("SELECT image_filename FROM cards WHERE wr_id = '1'").fetchone()
         assert stored == ("BT06-001.jpg",)
 
     def test_variants_share_a_number_without_colliding(self, scraper):
-        scraper.upsert_card("1", details(rarity="UR"), "BT06-001.jpg")
-        scraper.upsert_card("2", details(rarity="SPR"), "BT06-001-01.jpg")
+        scraper.cards.upsert(Card.from_details("1", details(rarity="UR"), "BT06-001.jpg"))
+        scraper.cards.upsert(Card.from_details("2", details(rarity="SPR"), "BT06-001-01.jpg"))
         rarities = scraper._conn.execute(
             "SELECT rarity FROM cards WHERE number = 'BT06-001' ORDER BY rarity"
         ).fetchall()
         assert rarities == [("SPR",), ("UR",)]
 
     def test_init_is_idempotent(self, scraper):
-        scraper.upsert_card("1", details())
+        scraper.cards.upsert(Card.from_details("1", details()))
         scraper._init_db()
         assert scraper._conn.execute("SELECT count(*) FROM cards").fetchone() == (1,)
 
@@ -208,7 +212,7 @@ class TestCardCatalogue:
     def test_a_row_the_app_would_reject_is_skipped(self, scraper, missing):
         # number and name are NOT NULL in the app's schema; a half-parsed card
         # is dropped rather than failing the insert mid-scrape.
-        assert scraper.upsert_card("1", details(**{missing: None})) is False
+        assert scraper.cards.upsert(Card.from_details("1", details(**{missing: None}))) is False
         assert scraper._conn.execute("SELECT count(*) FROM cards").fetchone() == (0,)
 
 
@@ -257,52 +261,52 @@ class TestBackfillMetadata:
         monkeypatch.setattr(scraper.board, "get_card_details", fake_details)
 
     def test_dry_run_makes_no_requests_and_writes_nothing(self, scraper, monkeypatch):
-        scraper.mark_as_scraped("1", "BT06-001", "BT06-001.jpg")
+        scraper.history.mark_as_scraped("1", "BT06-001", "BT06-001.jpg")
 
         def explode(wr_id):
             raise AssertionError("a dry run must not hit the network")
 
         monkeypatch.setattr(scraper.board, "get_card_details", explode)
-        assert scraper.backfill_metadata(dry_run=True) == (1, 0)
+        assert scraper.backfill.execute(dry_run=True) == (1, 0)
         assert scraper._conn.execute("SELECT count(*) FROM cards").fetchone() == (0,)
 
     def test_fills_only_the_rows_that_are_missing(self, scraper, monkeypatch):
-        scraper.mark_as_scraped("1", "BT06-001", "BT06-001.jpg")
-        scraper.mark_as_scraped("2", "BT06-002", "BT06-002.jpg")
-        scraper.upsert_card("1", details(), "BT06-001.jpg")
+        scraper.history.mark_as_scraped("1", "BT06-001", "BT06-001.jpg")
+        scraper.history.mark_as_scraped("2", "BT06-002", "BT06-002.jpg")
+        scraper.cards.upsert(Card.from_details("1", details(), "BT06-001.jpg"))
 
         seen = []
         self._stub_endpoint(scraper, monkeypatch, seen)
-        assert scraper.backfill_metadata(dry_run=False) == (1, 0)
+        assert scraper.backfill.execute(dry_run=False) == (1, 0)
         assert seen == ["2"]
 
     def test_carries_the_known_filename_across(self, scraper, monkeypatch):
-        scraper.mark_as_scraped("2", "BT06-002", "BT06-002-01.jpg")
+        scraper.history.mark_as_scraped("2", "BT06-002", "BT06-002-01.jpg")
         self._stub_endpoint(scraper, monkeypatch)
-        scraper.backfill_metadata(dry_run=False)
+        scraper.backfill.execute(dry_run=False)
         stored = scraper._conn.execute("SELECT image_filename, name FROM cards WHERE wr_id = '2'").fetchone()
         assert stored == ("BT06-002-01.jpg", "카드 2")
 
     def test_force_refreshes_rows_that_already_have_metadata(self, scraper, monkeypatch):
-        scraper.mark_as_scraped("1", "BT06-001", "BT06-001.jpg")
-        scraper.upsert_card("1", details(name="오래된 이름"), "BT06-001.jpg")
+        scraper.history.mark_as_scraped("1", "BT06-001", "BT06-001.jpg")
+        scraper.cards.upsert(Card.from_details("1", details(name="오래된 이름"), "BT06-001.jpg"))
 
         self._stub_endpoint(scraper, monkeypatch)
-        assert scraper.backfill_metadata(dry_run=False, force=True) == (1, 0)
+        assert scraper.backfill.execute(dry_run=False, force=True) == (1, 0)
         assert scraper._conn.execute("SELECT name FROM cards WHERE wr_id = '1'").fetchone() == ("카드 1",)
 
     def test_limit_caps_the_run(self, scraper, monkeypatch):
         for wr_id in ("1", "2", "3"):
-            scraper.mark_as_scraped(wr_id, f"BT06-00{wr_id}", f"BT06-00{wr_id}.jpg")
+            scraper.history.mark_as_scraped(wr_id, f"BT06-00{wr_id}", f"BT06-00{wr_id}.jpg")
 
         seen = []
         self._stub_endpoint(scraper, monkeypatch, seen)
-        assert scraper.backfill_metadata(dry_run=False, limit=2) == (2, 0)
+        assert scraper.backfill.execute(dry_run=False, limit=2) == (2, 0)
         assert seen == ["1", "2"]
 
     def test_a_failing_card_does_not_stop_the_run(self, scraper, monkeypatch):
         for wr_id in ("1", "2"):
-            scraper.mark_as_scraped(wr_id, f"BT06-00{wr_id}", f"BT06-00{wr_id}.jpg")
+            scraper.history.mark_as_scraped(wr_id, f"BT06-00{wr_id}", f"BT06-00{wr_id}.jpg")
 
         def flaky(wr_id):
             if wr_id == "1":
@@ -312,11 +316,11 @@ class TestBackfillMetadata:
             )
 
         monkeypatch.setattr(scraper.board, "get_card_details", flaky)
-        assert scraper.backfill_metadata(dry_run=False) == (1, 1)
+        assert scraper.backfill.execute(dry_run=False) == (1, 1)
 
     def test_gives_up_after_consecutive_failures(self, scraper, monkeypatch):
         for wr_id in "12345678":
-            scraper.mark_as_scraped(wr_id, f"BT06-00{wr_id}", f"BT06-00{wr_id}.jpg")
+            scraper.history.mark_as_scraped(wr_id, f"BT06-00{wr_id}", f"BT06-00{wr_id}.jpg")
 
         attempts = []
 
@@ -325,11 +329,11 @@ class TestBackfillMetadata:
             raise requests.ConnectionError("down")
 
         monkeypatch.setattr(scraper.board, "get_card_details", always_fails)
-        assert scraper.backfill_metadata(dry_run=False) == (0, main.MAX_CONSECUTIVE_PAGE_FAILURES)
-        assert len(attempts) == main.MAX_CONSECUTIVE_PAGE_FAILURES
+        assert scraper.backfill.execute(dry_run=False) == (0, MAX_CONSECUTIVE_PAGE_FAILURES)
+        assert len(attempts) == MAX_CONSECUTIVE_PAGE_FAILURES
 
     def test_nothing_to_do_is_not_an_error(self, scraper):
-        assert scraper.backfill_metadata(dry_run=False) == (0, 0)
+        assert scraper.backfill.execute(dry_run=False) == (0, 0)
 
 
 class TestScrapeCardStoresMetadata:
@@ -348,9 +352,9 @@ class TestScrapeCardStoresMetadata:
             lambda wr_id: board_client.BeautifulSoup(self._detail_html(), "html.parser"),
         )
         stub_get(scraper, FakeResponse())
-        scraper.scrape_card("1", "remote.jpg")
+        scraper.scrape.scrape_card("1", "remote.jpg")
 
-        assert scraper.is_already_scraped("1")
+        assert scraper.history.is_already_scraped("1")
         row = scraper._conn.execute(
             "SELECT number, name, cost, rarity, image_filename FROM cards WHERE wr_id = '1'"
         ).fetchone()
@@ -363,9 +367,9 @@ class TestScrapeCardStoresMetadata:
             lambda wr_id: board_client.BeautifulSoup("<html></html>", "html.parser"),
         )
         stub_get(scraper, FakeResponse())
-        scraper.scrape_card("1", "remote.jpg")
+        scraper.scrape.scrape_card("1", "remote.jpg")
 
-        assert scraper.is_already_scraped("1")
+        assert scraper.history.is_already_scraped("1")
         stored = scraper._conn.execute("SELECT card_id FROM scraped_cards WHERE wr_id = '1'").fetchone()
         assert stored == ("unknown_1",)
 
@@ -376,9 +380,9 @@ class TestScrapeCardStoresMetadata:
             lambda wr_id: board_client.BeautifulSoup(self._detail_html(), "html.parser"),
         )
         stub_get(scraper, FakeResponse(body=b"<html>404</html>"))
-        scraper.scrape_card("1", "remote.jpg")
+        scraper.scrape.scrape_card("1", "remote.jpg")
 
-        assert not scraper.is_already_scraped("1")
+        assert not scraper.history.is_already_scraped("1")
         assert scraper._conn.execute("SELECT count(*) FROM cards").fetchone() == (0,)
 
 
@@ -394,26 +398,26 @@ class TestImportSqliteHistory:
 
     def test_imports_rows(self, scraper, tmp_path):
         legacy = self._legacy_db(tmp_path / "old.db", [("1", "BT06-001", "BT06-001.jpg")])
-        assert scraper.import_sqlite_history(legacy, dry_run=False) == 1
-        assert scraper.is_already_scraped("1")
+        assert scraper.sqlite_import.execute(legacy, dry_run=False) == 1
+        assert scraper.history.is_already_scraped("1")
 
     def test_dry_run_writes_nothing(self, scraper, tmp_path):
         legacy = self._legacy_db(tmp_path / "old.db", [("1", "BT06-001", "BT06-001.jpg")])
-        assert scraper.import_sqlite_history(legacy, dry_run=True) == 1
-        assert not scraper.is_already_scraped("1")
+        assert scraper.sqlite_import.execute(legacy, dry_run=True) == 1
+        assert not scraper.history.is_already_scraped("1")
 
     def test_existing_rows_are_left_alone(self, scraper, tmp_path):
-        scraper.mark_as_scraped("1", "BT06-001", "BT06-001-01.jpg")
+        scraper.history.mark_as_scraped("1", "BT06-001", "BT06-001-01.jpg")
         legacy = self._legacy_db(tmp_path / "old.db", [("1", "BT06-001", "BT06-001.jpg")])
 
-        assert scraper.import_sqlite_history(legacy, dry_run=False) == 0
+        assert scraper.sqlite_import.execute(legacy, dry_run=False) == 0
 
         row = scraper._conn.execute("SELECT image_filename FROM scraped_cards WHERE wr_id = '1'").fetchone()
         assert row[0] == "BT06-001-01.jpg"
 
     def test_missing_file_raises(self, scraper, tmp_path):
         with pytest.raises(FileNotFoundError):
-            scraper.import_sqlite_history(tmp_path / "nope.db", dry_run=True)
+            scraper.sqlite_import.execute(tmp_path / "nope.db", dry_run=True)
 
 
 class TestDownloadImage:
@@ -530,7 +534,7 @@ class TestRobots:
             raise AssertionError("no page should be fetched")
 
         monkeypatch.setattr(scraper.board, "get_html", explode)
-        scraper.scrape_board()
+        scraper.scrape.execute()
 
 
 class TestEnvironmentSettings:
@@ -546,9 +550,9 @@ class TestEnvironmentSettings:
 class TestRepairFilenames:
     def test_repairs_unique_match(self, scraper):
         (scraper.board.downloads_dir / "BT06-037.jpg").write_bytes(JPEG_BODY)
-        scraper.mark_as_scraped("1065", "BT06-037", "source_hash_abc.jpg")
+        scraper.history.mark_as_scraped("1065", "BT06-037", "source_hash_abc.jpg")
 
-        scraper.repair_filenames(dry_run=False)
+        scraper.repair.execute(dry_run=False)
 
         stored = scraper._conn.execute(
             "SELECT image_filename FROM scraped_cards WHERE wr_id = '1065'"
@@ -557,9 +561,9 @@ class TestRepairFilenames:
 
     def test_dry_run_changes_nothing(self, scraper):
         (scraper.board.downloads_dir / "BT06-037.jpg").write_bytes(JPEG_BODY)
-        scraper.mark_as_scraped("1065", "BT06-037", "source_hash_abc.jpg")
+        scraper.history.mark_as_scraped("1065", "BT06-037", "source_hash_abc.jpg")
 
-        repaired, _, _ = scraper.repair_filenames(dry_run=True)
+        repaired, _, _ = scraper.repair.execute(dry_run=True)
 
         assert repaired == 1
         stored = scraper._conn.execute(
@@ -570,18 +574,18 @@ class TestRepairFilenames:
     def test_leaves_ambiguous_variants_alone(self, scraper):
         (scraper.board.downloads_dir / "BT06-037.jpg").write_bytes(JPEG_BODY)
         (scraper.board.downloads_dir / "BT06-037-01.jpg").write_bytes(JPEG_BODY)
-        scraper.mark_as_scraped("1065", "BT06-037", "source_hash_abc.jpg")
+        scraper.history.mark_as_scraped("1065", "BT06-037", "source_hash_abc.jpg")
 
-        repaired, ambiguous, _ = scraper.repair_filenames(dry_run=False)
+        repaired, ambiguous, _ = scraper.repair.execute(dry_run=False)
 
         assert (repaired, ambiguous) == (0, 1)
 
     def test_does_not_double_claim_a_file(self, scraper):
         (scraper.board.downloads_dir / "BT06-037.jpg").write_bytes(JPEG_BODY)
-        scraper.mark_as_scraped("1065", "BT06-037", "BT06-037.jpg")  # already correct
-        scraper.mark_as_scraped("1066", "BT06-037", "source_hash_abc.jpg")
+        scraper.history.mark_as_scraped("1065", "BT06-037", "BT06-037.jpg")  # already correct
+        scraper.history.mark_as_scraped("1066", "BT06-037", "source_hash_abc.jpg")
 
-        repaired, _, unresolved = scraper.repair_filenames(dry_run=False)
+        repaired, _, unresolved = scraper.repair.execute(dry_run=False)
 
         assert (repaired, unresolved) == (0, 1)
 
@@ -595,7 +599,7 @@ class TestScrapeBoard:
             return board_client.BeautifulSoup("<html><body></body></html>", "html.parser")
 
         monkeypatch.setattr(scraper.board, "get_html", fake_get_html)
-        scraper.scrape_board()
+        scraper.scrape.execute()
         assert len(pages) == 1
 
     def test_gives_up_after_consecutive_failures(self, scraper, monkeypatch):
@@ -606,8 +610,8 @@ class TestScrapeBoard:
             raise requests.ConnectionError("boom")
 
         monkeypatch.setattr(scraper.board, "get_html", always_fails)
-        scraper.scrape_board()
-        assert len(attempts) == main.MAX_CONSECUTIVE_PAGE_FAILURES
+        scraper.scrape.execute()
+        assert len(attempts) == MAX_CONSECUTIVE_PAGE_FAILURES
 
     def test_survives_a_single_transient_failure(self, scraper, monkeypatch):
         calls = {"n": 0}
@@ -619,7 +623,7 @@ class TestScrapeBoard:
             return board_client.BeautifulSoup("<html></html>", "html.parser")
 
         monkeypatch.setattr(scraper.board, "get_html", flaky)
-        scraper.scrape_board()
+        scraper.scrape.execute()
         assert calls["n"] == 2  # recovered and then hit the empty-page stop
 
     def test_respects_max_pages(self, scraper, monkeypatch):
@@ -627,9 +631,9 @@ class TestScrapeBoard:
         monkeypatch.setattr(
             scraper.board, "get_html", lambda url: board_client.BeautifulSoup(html, "html.parser")
         )
-        monkeypatch.setattr(scraper, "scrape_card", lambda *a: None)
-        scraper.mark_as_scraped("1", "x", "x.jpg")  # so nothing is downloaded
-        scraper.scrape_board(max_pages=2)  # must terminate
+        monkeypatch.setattr(scraper.scrape, "scrape_card", lambda *a: None)
+        scraper.history.mark_as_scraped("1", "x", "x.jpg")  # so nothing is downloaded
+        scraper.scrape.execute(max_pages=2)  # must terminate
 
     def test_skips_already_scraped(self, scraper, monkeypatch):
         html = '<div class="gall_img"><a href="f.jpg♬1"></a></div>'
@@ -637,7 +641,7 @@ class TestScrapeBoard:
         monkeypatch.setattr(
             scraper.board, "get_html", lambda url: board_client.BeautifulSoup(html, "html.parser")
         )
-        monkeypatch.setattr(scraper, "scrape_card", lambda wr_id, fn: seen.append(wr_id))
-        scraper.mark_as_scraped("1", "x", "x.jpg")
-        scraper.scrape_board(max_pages=1)
+        monkeypatch.setattr(scraper.scrape, "scrape_card", lambda wr_id, fn: seen.append(wr_id))
+        scraper.history.mark_as_scraped("1", "x", "x.jpg")
+        scraper.scrape.execute(max_pages=1)
         assert seen == []
