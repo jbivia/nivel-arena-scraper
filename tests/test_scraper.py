@@ -8,6 +8,7 @@ import requests
 
 import main
 from main import MAX_IMAGE_BYTES, DatabaseNotConfigured, NivelArenaScraper
+from nivel.infrastructure.persistence.connection import DATABASE_URL_ENV, redact_conninfo
 
 JPEG_BODY = b"\xff\xd8\xff\xe0" + b"\x00" * 512
 
@@ -71,8 +72,8 @@ class TestConnectionConfig:
     """These need no database: they cover the paths taken before one is opened."""
 
     def test_missing_url_is_a_clear_error(self, tmp_path, monkeypatch):
-        monkeypatch.delenv(main.DATABASE_URL_ENV, raising=False)
-        with pytest.raises(DatabaseNotConfigured, match=main.DATABASE_URL_ENV):
+        monkeypatch.delenv(DATABASE_URL_ENV, raising=False)
+        with pytest.raises(DatabaseNotConfigured, match=DATABASE_URL_ENV):
             NivelArenaScraper("http://example.test", "cardlists", downloads_dir=tmp_path / "downloads")
 
     @pytest.mark.parametrize(
@@ -84,11 +85,11 @@ class TestConnectionConfig:
         ],
     )
     def test_redacts_password_for_logging(self, url, expected):
-        assert main.redact_conninfo(url) == expected
+        assert redact_conninfo(url) == expected
 
     def test_redaction_drops_query_and_fragment(self):
         # sslmode etc. are harmless, but a stray password= there would not be.
-        redacted = main.redact_conninfo("postgres://u:p@h:5432/db?password=hunter2#frag")
+        redacted = redact_conninfo("postgres://u:p@h:5432/db?password=hunter2#frag")
         assert "hunter2" not in redacted
 
 

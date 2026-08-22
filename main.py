@@ -21,7 +21,7 @@ import re
 import sqlite3
 import time
 from pathlib import Path
-from urllib.parse import quote, urlparse, urlunparse
+from urllib.parse import quote, urlparse
 from urllib.robotparser import RobotFileParser
 
 import psycopg
@@ -34,6 +34,11 @@ import card_metadata
 from nivel.domain.nikke.entity.card import Card
 from nivel.domain.nikke.exception.catalogue import CatalogueTableMissing, DatabaseNotConfigured
 from nivel.domain.nikke.value_object.card_naming import parse_card_link, safe_stem
+from nivel.infrastructure.nikke.persistence.postgres_card_repository import PostgresCardRepository
+from nivel.infrastructure.nikke.persistence.postgres_scrape_history_repository import (
+    PostgresScrapeHistoryRepository,
+)
+from nivel.infrastructure.persistence.connection import connect, redact_conninfo, resolve_database_url
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger("scraper")
@@ -74,70 +79,6 @@ DEFAULT_RETRY = Retry(
 # aborting the whole run on the first transient error.
 MAX_CONSECUTIVE_PAGE_FAILURES = 3
 
-# Environment variable holding the libpq connection URL, e.g.
-# postgres://user:password@nivel-db:5432/nivel
-DATABASE_URL_ENV = "SCRAPER_DATABASE_URL"
-
-# Seconds to wait for the PostgreSQL TCP connect. Without it a wedged host
-# leaves the scraper hanging on startup indefinitely.
-DB_CONNECT_TIMEOUT = 10
-
-# Shows up in pg_stat_activity, so a long-running scrape is identifiable from
-# the tracker's side of the same database.
-DB_APPLICATION_NAME = "nivel-arena-scraper"
-
-
-def redact_conninfo(url):
-    """Return ``url`` with any password replaced, safe to log.
-
-    Anything unparseable is reduced to a placeholder rather than echoed: a
-    malformed URL is exactly the case where the password might land in a
-    surprising position.
-    """
-    try:
-        parts = urlparse(url)
-    except ValueError:
-        return "<unparseable connection string>"
-
-    if not parts.hostname:
-        return "<connection string>"
-
-    netloc = parts.hostname
-    if parts.port:
-        netloc = f"{netloc}:{parts.port}"
-    if parts.username:
-        netloc = f"{parts.username}:***@{netloc}" if parts.password else f"{parts.username}@{netloc}"
-
-    return urlunparse((parts.scheme, netloc, parts.path, "", "", ""))
-
-
-# Columns the scraper writes into the tracker app's `cards` table. Checked at
-# startup so a database that has not had the app's migrations applied says so,
-# instead of failing on the first insert.
-CARD_COLUMNS = frozenset(
-    {
-        "wr_id",
-        "number",
-        "set_code",
-        "name",
-        "type",
-        "type_en",
-        "element",
-        "element_en",
-        "cost",
-        "power",
-        "hit",
-        "rarity",
-        "affiliation",
-        "keywords",
-        "effect",
-        "trigger_text",
-        "product_name",
-        "ip",
-        "image_filename",
-    }
-)
-
 
 class OffHostRedirect(RuntimeError):
     """Raised when a response came from a host other than the configured board."""
@@ -166,25 +107,14 @@ class NivelArenaScraper:
         self.min_delay = min_delay
         self.max_delay = max_delay
 
-        self.database_url = database_url or os.environ.get(DATABASE_URL_ENV, "")
-        if not self.database_url:
-            raise DatabaseNotConfigured(
-                f"No PostgreSQL connection configured -- set {DATABASE_URL_ENV}, e.g. "
-                f"{DATABASE_URL_ENV}=postgres://user:password@nivel-db:5432/nivel"
-            )
+        self.database_url = resolve_database_url(database_url)
 
         self.downloads_dir = Path(downloads_dir or os.environ.get("SCRAPER_DOWNLOADS_DIR", "/app/downloads"))
         self.downloads_dir.mkdir(parents=True, exist_ok=True)
 
-        self._conn = psycopg.connect(
-            self.database_url,
-            connect_timeout=DB_CONNECT_TIMEOUT,
-            application_name=DB_APPLICATION_NAME,
-        )
-        # Autocommit keeps a long scrape from holding an idle transaction open
-        # against a database the tracker app is also using; the one multi-row
-        # operation (repair_filenames) opens an explicit transaction instead.
-        self._conn.autocommit = True
+        self._conn = connect(self.database_url)
+        self._cards = PostgresCardRepository(self._conn)
+        self._history = PostgresScrapeHistoryRepository(self._conn)
 
         self.session = requests.Session()
         adapter = HTTPAdapter(max_retries=DEFAULT_RETRY)
@@ -271,137 +201,24 @@ class NivelArenaScraper:
     # --- database ---------------------------------------------------------
 
     def _init_db(self):
-        # scraped_cards is the scraper's own, created here. `cards` is not: it
-        # belongs to the tracker app's drizzle migrations, so it is verified
-        # rather than created -- writing our own version of it would leave two
-        # definitions to drift apart, and would break the app's next migration.
-        self._conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS scraped_cards (
-                wr_id TEXT PRIMARY KEY,
-                card_id TEXT,
-                image_filename TEXT,
-                scraped_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            )
-            """
-        )
-        self._verify_cards_table()
+        # Two tables, two owners. The history is ours and its repository creates
+        # it; `cards` belongs to the tracker app's drizzle migrations, so it is
+        # verified rather than created -- writing our own version of it would
+        # leave two definitions to drift apart, and would break the app's next
+        # migration.
+        self._history.ensure_schema()
+        self._cards.verify_schema()
         log.info("Database ready at %s", redact_conninfo(self.database_url))
 
-    def _verify_cards_table(self):
-        """Fail early and clearly if the catalogue table is missing or stale.
-
-        Without this the first insert fails deep into a scrape with a bare
-        ``UndefinedColumn``, which says nothing about the migration that has not
-        been run.
-        """
-        present = {
-            name
-            for (name,) in self._conn.execute(
-                "SELECT column_name FROM information_schema.columns"
-                " WHERE table_name = 'cards' AND table_schema = current_schema()"
-            ).fetchall()
-        }
-
-        if not present:
-            raise CatalogueTableMissing(
-                "No 'cards' table in this database. Its schema belongs to the "
-                "nivel-arena-collection-tracker app -- run `make db-migrate` there first."
-            )
-
-        missing = sorted(CARD_COLUMNS - present)
-        if missing:
-            raise CatalogueTableMissing(
-                f"The 'cards' table is missing {', '.join(missing)}. It is probably an older "
-                "revision -- run `make db-migrate` in nivel-arena-collection-tracker."
-            )
-
     def is_already_scraped(self, wr_id):
-        cursor = self._conn.execute("SELECT 1 FROM scraped_cards WHERE wr_id = %s", (wr_id,))
-        return cursor.fetchone() is not None
+        return self._history.is_already_scraped(wr_id)
 
     def mark_as_scraped(self, wr_id, card_id, image_filename):
-        # DO NOTHING so a concurrent run cannot crash the scrape on a PK clash.
-        self._conn.execute(
-            "INSERT INTO scraped_cards (wr_id, card_id, image_filename) VALUES (%s, %s, %s)"
-            " ON CONFLICT (wr_id) DO NOTHING",
-            (wr_id, card_id, image_filename),
-        )
+        self._history.mark_as_scraped(wr_id, card_id, image_filename)
 
     def upsert_card(self, wr_id, details, image_filename=None):
-        """Write one card's catalogue fields, refreshing an existing row.
-
-        DO UPDATE rather than DO NOTHING: the site corrects card text after
-        release, and a re-scrape should carry the correction through. The
-        filename is coalesced because a metadata backfill knows the row it is
-        filling but not necessarily the file it was saved as.
-
-        ``name`` and ``number`` are NOT NULL in the app's schema, so a card
-        whose header would not parse is skipped rather than half-written --
-        which field is missing is the entity's business, not this method's.
-
-        Lists map to PostgreSQL ``TEXT[]`` directly under psycopg 3; every
-        value is bound, none is interpolated.
-        """
-        card = Card.from_details(wr_id, details, image_filename)
-        missing = card.missing_required_field()
-        if missing:
-            log.warning("Skipping catalogue row for wr_id %s: no %s parsed.", wr_id, missing)
-            return False
-
-        self._conn.execute(
-            """
-            INSERT INTO cards (
-                wr_id, number, set_code, name, type, type_en,
-                element, element_en, cost, power, hit, rarity, affiliation,
-                keywords, effect, trigger_text, product_name, ip, image_filename
-            ) VALUES (
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
-            )
-            ON CONFLICT (wr_id) DO UPDATE SET
-                number = EXCLUDED.number,
-                set_code = EXCLUDED.set_code,
-                name = EXCLUDED.name,
-                type = EXCLUDED.type,
-                type_en = EXCLUDED.type_en,
-                element = EXCLUDED.element,
-                element_en = EXCLUDED.element_en,
-                cost = EXCLUDED.cost,
-                power = EXCLUDED.power,
-                hit = EXCLUDED.hit,
-                rarity = EXCLUDED.rarity,
-                affiliation = EXCLUDED.affiliation,
-                keywords = EXCLUDED.keywords,
-                effect = EXCLUDED.effect,
-                trigger_text = EXCLUDED.trigger_text,
-                product_name = EXCLUDED.product_name,
-                ip = EXCLUDED.ip,
-                image_filename = COALESCE(EXCLUDED.image_filename, cards.image_filename),
-                updated_at = now()
-            """,
-            (
-                card.wr_id,
-                card.number,
-                card.set_code,
-                card.name,
-                card.card_type,
-                card.card_type_en,
-                card.element,
-                card.element_en,
-                card.cost,
-                card.power,
-                card.hit,
-                card.rarity,
-                card.affiliation,
-                card.keywords,
-                card.effect,
-                card.trigger_text,
-                card.product_name,
-                card.ip,
-                card.image_filename,
-            ),
-        )
-        return True
+        """Store one parsed card. Returns whether it landed."""
+        return self._cards.upsert(Card.from_details(wr_id, details, image_filename))
 
     # --- http -------------------------------------------------------------
 
@@ -638,18 +455,9 @@ class NivelArenaScraper:
         Returns ``(processed, failures)``.
         """
         if force:
-            query = "SELECT wr_id, image_filename FROM scraped_cards ORDER BY wr_id"
+            rows = self._history.downloaded_entries(limit)
         else:
-            query = (
-                "SELECT s.wr_id, s.image_filename FROM scraped_cards s"
-                " LEFT JOIN cards c USING (wr_id)"
-                " WHERE c.wr_id IS NULL ORDER BY s.wr_id"
-            )
-
-        if limit is not None:
-            rows = self._conn.execute(f"{query} LIMIT %s", (limit,)).fetchall()
-        else:
-            rows = self._conn.execute(query).fetchall()
+            rows = self._cards.wr_ids_without_metadata(limit)
 
         if dry_run:
             # Deliberately makes no requests: a preview that hammered the site
@@ -713,7 +521,7 @@ class NivelArenaScraper:
         A row is only repaired when exactly one unclaimed file on disk matches
         its card_id, so ambiguous variants are left alone.
         """
-        rows = self._conn.execute("SELECT wr_id, card_id, image_filename FROM scraped_cards").fetchall()
+        rows = self._history.all_entries()
 
         on_disk = {p.name for p in self.downloads_dir.glob("*.jpg")}
         claimed = {name for _, _, name in rows if name in on_disk}
@@ -740,14 +548,8 @@ class NivelArenaScraper:
                 log.warning("wr_id %s (%s): no matching file on disk.", wr_id, card_id)
                 unresolved += 1
 
-        # One transaction for the whole repair: a partially-applied rename pass
-        # is harder to reason about than one that either lands or does not.
-        if not dry_run and updates:
-            with self._conn.transaction(), self._conn.cursor() as cursor:
-                cursor.executemany(
-                    "UPDATE scraped_cards SET image_filename = %s WHERE wr_id = %s",
-                    updates,
-                )
+        if not dry_run:
+            self._history.repoint_filenames(updates)
 
         log.info(
             "%s: %d repaired, %d ambiguous, %d unresolved (of %d rows).",
@@ -784,24 +586,14 @@ class NivelArenaScraper:
             return 0
 
         if dry_run:
-            existing = {
-                wr_id
-                for (wr_id,) in self._conn.execute(
-                    "SELECT wr_id FROM scraped_cards WHERE wr_id = ANY(%s)",
-                    ([str(wr_id) for wr_id, _, _ in rows],),
-                ).fetchall()
-            }
+            existing = self._history.known_wr_ids(str(wr_id) for wr_id, _, _ in rows)
             new = sum(1 for wr_id, _, _ in rows if str(wr_id) not in existing)
             log.info("Dry run: %d of %d rows from %s would be imported.", new, len(rows), sqlite_path)
             return new
 
-        with self._conn.transaction(), self._conn.cursor() as cursor:
-            cursor.executemany(
-                "INSERT INTO scraped_cards (wr_id, card_id, image_filename) VALUES (%s, %s, %s)"
-                " ON CONFLICT (wr_id) DO NOTHING",
-                [(str(wr_id), card_id, image_filename) for wr_id, card_id, image_filename in rows],
-            )
-            imported = cursor.rowcount
+        imported = self._history.import_entries(
+            [(str(wr_id), card_id, image_filename) for wr_id, card_id, image_filename in rows]
+        )
 
         log.info("Imported %d of %d rows from %s.", imported, len(rows), sqlite_path)
         return imported

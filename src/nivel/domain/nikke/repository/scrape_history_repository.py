@@ -29,6 +29,14 @@ class ScrapeHistoryRepository(ABC):
         """Every ``(wr_id, card_id, image_filename)`` recorded so far."""
 
     @abstractmethod
+    def downloaded_entries(self, limit=None):
+        """Every download as ``(wr_id, image_filename)``, oldest write-ID first."""
+
+    @abstractmethod
+    def known_wr_ids(self, wr_ids):
+        """Which of ``wr_ids`` are already recorded."""
+
+    @abstractmethod
     def repoint_filenames(self, updates):
         """Apply ``(image_filename, wr_id)`` pairs in a single transaction."""
 
