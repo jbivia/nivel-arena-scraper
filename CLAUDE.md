@@ -17,9 +17,6 @@ deployment.
 
 ## Things the code will not tell you
 
-- **`board.py` and `catalogue.py` are not wired up.** Nothing imports them and the
-  Containerfile does not copy them into the image; the live logic is in `main.py`, which
-  carries its own `CARD_COLUMNS` and `_verify_cards_table`. Change `main.py`.
 - **`convert_to_png.py` masks geometrically, not by colour.** It projects a background mask
   onto each axis to find the card rectangles, then cuts an antialiased rounded rectangle. A
   colour flood fill was tried first and escaped through light artwork and through the gutter
