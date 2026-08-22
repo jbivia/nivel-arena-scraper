@@ -31,6 +31,12 @@ RUN pip install --no-cache-dir --require-hashes -r requirements.lock
 # Application code stays owned by root: the unprivileged runtime user can read
 # and execute it but cannot modify it.
 COPY main.py card_metadata.py convert_to_png.py ./
+COPY src/ ./src/
+
+# The layered code lives under src/ and is imported as `nivel.…`. The entry
+# points at /app are run by path (`python main.py`), which only ever puts /app
+# itself on sys.path, so the package directory has to be named here.
+ENV PYTHONPATH=/app/src
 
 # Only the mounted data directories are writable by the runtime user.
 # Scrape state lives in PostgreSQL, so there is no database file to host here.

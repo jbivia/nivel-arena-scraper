@@ -26,7 +26,9 @@ classifiers = [
 [tool.pytest.ini_options]
 minversion = "9.0"
 testpaths = ["tests"]
-pythonpath = ["."]
+# `src` for the `nivel` package, `.` for the entry-point shims at the root that
+# the container, the Makefile and the Synology scheduler all invoke by name.
+pythonpath = ["src", "."]
 # --strict-markers rejects a typo'd @pytest.mark; --strict-config rejects a
 # typo'd key in this very block, which would otherwise be silently ignored.
 addopts = "-q --strict-markers --strict-config"
@@ -87,12 +89,12 @@ ignore = [
 "tests/*" = ["S105", "S106", "SLF001", "SIM300"]
 
 [tool.ruff.lint.flake8-tidy-imports]
-# The modules sit at the repo root and are imported by name; a relative import
-# would only ever be a mistake.
+# Everything is imported by absolute name, entry-point shims and package alike;
+# a relative import would only ever be a mistake.
 ban-relative-imports = "all"
 
 [tool.ruff.lint.isort]
-known-first-party = ["card_metadata", "convert_to_png", "main"]
+known-first-party = ["card_metadata", "convert_to_png", "main", "nivel"]
 
 [tool.ruff.format]
 docstring-code-format = true

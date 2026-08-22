@@ -20,7 +20,6 @@ import random
 import re
 import sqlite3
 import time
-import unicodedata
 from pathlib import Path
 from urllib.parse import quote, urlparse, urlunparse
 from urllib.robotparser import RobotFileParser
@@ -32,14 +31,13 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 import card_metadata
+from nivel.domain.nikke.entity.card import Card
+from nivel.domain.nikke.exception.catalogue import CatalogueTableMissing, DatabaseNotConfigured
+from nivel.domain.nikke.value_object.card_naming import parse_card_link, safe_stem
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger("scraper")
 
-# The site's JavaScript encodes card links as "{image_filename}♬{wr_id}".
-# U+266C (beamed sixteenth notes) is the custom delimiter between the image
-# file on disk and the GnuBoard5 write-ID used by the AJAX detail endpoint.
-HREF_DELIMITER = "♬"
 
 # (connect, read) timeouts. Without these a half-open socket hangs the run
 # forever -- urllib3's Retry only covers responses, never a stalled read.
@@ -64,14 +62,6 @@ LIST_PAGE_DELAY = (2.0, 5.0)
 
 # JPEG SOI marker. Guards against an HTML error page served with a 200.
 JPEG_MAGIC = b"\xff\xd8\xff"
-
-# Longest filename stem we will write, in UTF-8 bytes (ext4 caps names at 255).
-MAX_STEM_BYTES = 100
-
-# Anything outside this set is dropped from a card ID before it becomes a
-# filename. \w is Unicode-aware, so Korean card names survive, while path
-# separators, dots and control characters cannot.
-_UNSAFE_NAME_CHARS = re.compile(r"[^\w-]", re.UNICODE)
 
 DEFAULT_RETRY = Retry(
     total=3,
@@ -121,49 +111,6 @@ def redact_conninfo(url):
     return urlunparse((parts.scheme, netloc, parts.path, "", "", ""))
 
 
-def safe_stem(raw, fallback):
-    """Turn scraped text into a filename stem that cannot escape its directory.
-
-    Returns ``fallback`` when nothing usable survives sanitisation.
-    """
-    normalised = unicodedata.normalize("NFKC", raw or "")
-    cleaned = _UNSAFE_NAME_CHARS.sub("", normalised).strip("-_")
-
-    # Truncate on a byte boundary so multi-byte names stay valid UTF-8.
-    encoded = cleaned.encode("utf-8")[:MAX_STEM_BYTES]
-    cleaned = encoded.decode("utf-8", errors="ignore").strip("-_")
-
-    return cleaned or fallback
-
-
-def parse_card_link(href):
-    """Split a board link into ``(image_filename, wr_id)``.
-
-    Returns ``None`` when the href is not a well-formed card link. The image
-    filename is validated as a bare name so it cannot walk the remote path.
-    """
-    if not href or HREF_DELIMITER not in href:
-        return None
-
-    parts = href.split(HREF_DELIMITER)
-    if len(parts) != 2:
-        return None
-
-    img_filename, wr_id = parts[0].strip(), parts[1].strip()
-    if not img_filename or not wr_id:
-        return None
-
-    # wr_id goes into a POST body and a DB key; the board only ever emits digits.
-    if not wr_id.isdigit():
-        return None
-
-    # Reject anything that is not a plain filename before it reaches a URL.
-    if "/" in img_filename or "\\" in img_filename or img_filename.startswith("."):
-        return None
-
-    return img_filename, wr_id
-
-
 # Columns the scraper writes into the tracker app's `cards` table. Checked at
 # startup so a database that has not had the app's migrations applied says so,
 # instead of failing on the first insert.
@@ -190,14 +137,6 @@ CARD_COLUMNS = frozenset(
         "image_filename",
     }
 )
-
-
-class DatabaseNotConfigured(RuntimeError):
-    """Raised when no PostgreSQL connection string is available."""
-
-
-class CatalogueTableMissing(RuntimeError):
-    """Raised when the app's ``cards`` table is absent or predates this scraper."""
 
 
 class OffHostRedirect(RuntimeError):
@@ -398,17 +337,16 @@ class NivelArenaScraper:
         filling but not necessarily the file it was saved as.
 
         ``name`` and ``number`` are NOT NULL in the app's schema, so a card
-        whose header would not parse is skipped rather than half-written.
+        whose header would not parse is skipped rather than half-written --
+        which field is missing is the entity's business, not this method's.
 
         Lists map to PostgreSQL ``TEXT[]`` directly under psycopg 3; every
         value is bound, none is interpolated.
         """
-        if not details["card_number"] or not details["name"]:
-            log.warning(
-                "Skipping catalogue row for wr_id %s: no %s parsed.",
-                wr_id,
-                "card number" if not details["card_number"] else "name",
-            )
+        card = Card.from_details(wr_id, details, image_filename)
+        missing = card.missing_required_field()
+        if missing:
+            log.warning("Skipping catalogue row for wr_id %s: no %s parsed.", wr_id, missing)
             return False
 
         self._conn.execute(
@@ -442,25 +380,25 @@ class NivelArenaScraper:
                 updated_at = now()
             """,
             (
-                wr_id,
-                details["card_number"],
-                details["set_code"],
-                details["name"],
-                details["card_type"],
-                details["card_type_en"],
-                details["element"],
-                details["element_en"],
-                details["cost"],
-                details["power"],
-                details["hit"],
-                details["rarity"],
-                details["affiliation"],
-                details["keywords"],
-                details["effect"],
-                details["trigger_text"],
-                details["product_name"],
-                details["ip"],
-                image_filename,
+                card.wr_id,
+                card.number,
+                card.set_code,
+                card.name,
+                card.card_type,
+                card.card_type_en,
+                card.element,
+                card.element_en,
+                card.cost,
+                card.power,
+                card.hit,
+                card.rarity,
+                card.affiliation,
+                card.keywords,
+                card.effect,
+                card.trigger_text,
+                card.product_name,
+                card.ip,
+                card.image_filename,
             ),
         )
         return True
