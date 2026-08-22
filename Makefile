@@ -15,7 +15,10 @@ LOAD_ENV = set -a; . ./.env; set +a;
 
 # `nivel-db` only resolves inside the container network, so host-side recipes
 # prefer SCRAPER_DATABASE_URL_LOCAL (localhost) when .env defines one.
-LOAD_ENV_HOST = $(LOAD_ENV) export SCRAPER_DATABASE_URL="$${SCRAPER_DATABASE_URL_LOCAL:-$$SCRAPER_DATABASE_URL}";
+# PYTHONPATH mirrors the Containerfile: `python main.py` puts only the repo root
+# on sys.path, and the layered code lives under src/.
+LOAD_ENV_HOST = $(LOAD_ENV) export SCRAPER_DATABASE_URL="$${SCRAPER_DATABASE_URL_LOCAL:-$$SCRAPER_DATABASE_URL}" \
+                PYTHONPATH=src;
 
 # Compiling the locks needs uv, which lives in the venv. Bootstrapping it is a
 # chicken-and-egg case -- `make venv` installs from a lock -- so `make lock`

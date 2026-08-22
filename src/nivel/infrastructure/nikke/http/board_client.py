@@ -1,21 +1,21 @@
-"""HTTP access to the GnuBoard5 card board, plus the naming rules around it.
+"""HTTP access to the GnuBoard5 card board, and the politeness around it.
 
-The target site is served over plaintext HTTP only (it has no TLS listener), so
-every response is treated as untrusted input: sizes are capped, content types
-are checked, magic bytes are verified, and a redirect that lands on another
-host is refused. Crawl politeness -- robots.txt and jittered delays -- lives
-here too, because it is a property of talking to the board rather than of what
-the scraper does with what comes back.
+The target site is served over plaintext HTTP only -- it has no TLS listener --
+so every response is treated as untrusted input: sizes are capped, content types
+and magic bytes are checked, and a redirect that lands on another host is
+refused. Crawl politeness lives here too, because obeying robots.txt and pacing
+requests are properties of talking to this board rather than of what the scraper
+later does with what comes back.
 
-This module holds no database state: it fetches, validates and writes files,
-and hands parsed soup back to the caller.
+This module holds no database state: it fetches, validates and writes files, and
+hands parsed soup back to the caller.
 """
 
 import logging
+import os
 import random
 import re
 import time
-import unicodedata
 from pathlib import Path
 from urllib.parse import quote, urlparse
 from urllib.robotparser import RobotFileParser
@@ -25,12 +25,9 @@ from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-log = logging.getLogger("scraper.board")
+from nivel.infrastructure.nikke.http.exception import OffHostRedirect, ResponseTooLarge
 
-# The site's JavaScript encodes card links as "{image_filename}♬{wr_id}".
-# U+266C (beamed sixteenth notes) is the custom delimiter between the image
-# file on disk and the GnuBoard5 write-ID used by the AJAX detail endpoint.
-HREF_DELIMITER = "♬"
+log = logging.getLogger("scraper")
 
 # (connect, read) timeouts. Without these a half-open socket hangs the run
 # forever -- urllib3's Retry only covers responses, never a stalled read.
@@ -56,18 +53,6 @@ LIST_PAGE_DELAY = (2.0, 5.0)
 # JPEG SOI marker. Guards against an HTML error page served with a 200.
 JPEG_MAGIC = b"\xff\xd8\xff"
 
-# Longest filename stem we will write, in UTF-8 bytes (ext4 caps names at 255).
-MAX_STEM_BYTES = 100
-
-# Anything outside this set is dropped from a card ID before it becomes a
-# filename. \w is Unicode-aware, so Korean card names survive, while path
-# separators, dots and control characters cannot.
-_UNSAFE_NAME_CHARS = re.compile(r"[^\w-]", re.UNICODE)
-
-DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
-)
-
 DEFAULT_RETRY = Retry(
     total=3,
     backoff_factor=2,
@@ -75,60 +60,13 @@ DEFAULT_RETRY = Retry(
     allowed_methods=["GET", "POST"],
 )
 
-
-class OffHostRedirect(RuntimeError):
-    """Raised when a response came from a host other than the configured board."""
-
-
-class ResponseTooLarge(RuntimeError):
-    """Raised when a response body exceeded its size cap."""
-
-
-def safe_stem(raw, fallback):
-    """Turn scraped text into a filename stem that cannot escape its directory.
-
-    Returns ``fallback`` when nothing usable survives sanitisation.
-    """
-    normalised = unicodedata.normalize("NFKC", raw or "")
-    cleaned = _UNSAFE_NAME_CHARS.sub("", normalised).strip("-_")
-
-    # Truncate on a byte boundary so multi-byte names stay valid UTF-8.
-    encoded = cleaned.encode("utf-8")[:MAX_STEM_BYTES]
-    cleaned = encoded.decode("utf-8", errors="ignore").strip("-_")
-
-    return cleaned or fallback
-
-
-def parse_card_link(href):
-    """Split a board link into ``(image_filename, wr_id)``.
-
-    Returns ``None`` when the href is not a well-formed card link. The image
-    filename is validated as a bare name so it cannot walk the remote path.
-    """
-    if not href or HREF_DELIMITER not in href:
-        return None
-
-    parts = href.split(HREF_DELIMITER)
-    if len(parts) != 2:
-        return None
-
-    img_filename, wr_id = parts[0].strip(), parts[1].strip()
-    if not img_filename or not wr_id:
-        return None
-
-    # wr_id goes into a POST body and a DB key; the board only ever emits digits.
-    if not wr_id.isdigit():
-        return None
-
-    # Reject anything that is not a plain filename before it reaches a URL.
-    if "/" in img_filename or "\\" in img_filename or img_filename.startswith("."):
-        return None
-
-    return img_filename, wr_id
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
+)
 
 
 class BoardClient:
-    """Every request the scraper makes to the board, and every file it writes."""
+    """One board, one session, one downloads directory."""
 
     def __init__(
         self,
@@ -140,8 +78,6 @@ class BoardClient:
         obey_robots=True,
         user_agent=None,
     ):
-        self.session = None
-
         self.base_url = base_url.rstrip("/")
         self.board_id = board_id
         self.ajax_url = f"{self.base_url}/skin/board/card_list_new/get_info.php"
@@ -149,7 +85,7 @@ class BoardClient:
         self.min_delay = min_delay
         self.max_delay = max_delay
 
-        self.downloads_dir = Path(downloads_dir)
+        self.downloads_dir = Path(downloads_dir or os.environ.get("SCRAPER_DOWNLOADS_DIR", "/app/downloads"))
         self.downloads_dir.mkdir(parents=True, exist_ok=True)
 
         self.session = requests.Session()
@@ -158,47 +94,32 @@ class BoardClient:
         self.session.mount("https://", adapter)
         self.session.headers.update(
             {
-                "User-Agent": user_agent or DEFAULT_USER_AGENT,
+                "User-Agent": user_agent or os.environ.get("SCRAPER_USER_AGENT", DEFAULT_USER_AGENT),
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
                 "image/avif,image/webp,*/*;q=0.8",
                 "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
             }
         )
 
-        # Behind a cleanup: a constructor that raises never hands back an object
-        # to close, so the session it opened would otherwise be stranded.
-        try:
-            self._robots = self._load_robots() if obey_robots else None
-        except BaseException:
-            self.close()
-            raise
+        self.robots = self._load_robots() if obey_robots else None
 
     def close(self):
-        """Release the HTTP session. Safe to call more than once."""
+        """Release the session. Safe to call more than once."""
         session, self.session = self.session, None
         if session is not None:
             session.close()
 
-    # --- urls -------------------------------------------------------------
-
-    def list_page_url(self, page):
-        return f"{self.base_url}/bbs/board.php?bo_table={self.board_id}&page={page}"
-
-    def image_url(self, img_filename):
-        # quote() keeps a hostile filename from injecting query/fragment parts
-        # into the URL; parse_card_link has already rejected path separators.
-        return f"{self.base_url}/data/file/{self.board_id}/{quote(img_filename, safe='')}"
-
     # --- politeness -------------------------------------------------------
 
-    def _polite_sleep(self, low, high):
+    def polite_sleep(self, low, high):
         """Pause for a jittered interval so requests are never evenly spaced."""
         delay = random.uniform(low, high)  # noqa: S311 - politeness jitter, not a secret
         log.info("Sleeping %.2fs to respect rate limits...", delay)
         time.sleep(delay)
 
-    def pause_between_cards(self):
-        self._polite_sleep(self.min_delay, self.max_delay)
+    def sleep_between_cards(self):
+        """Wait the configured per-card interval."""
+        self.polite_sleep(self.min_delay, self.max_delay)
 
     def _load_robots(self):
         """Fetch robots.txt. A missing file means 'no restrictions'."""
@@ -220,17 +141,17 @@ class BoardClient:
         return parser
 
     def may_fetch(self, url):
-        if self._robots is None:
+        if self.robots is None:
             return True
         agent = self.session.headers.get("User-Agent", "*")
-        allowed = self._robots.can_fetch(agent, url)
+        allowed = self.robots.can_fetch(agent, url)
         if not allowed:
             log.warning("robots.txt disallows %s -- skipping.", url)
         return allowed
 
-    # --- documents --------------------------------------------------------
+    # --- fetching ---------------------------------------------------------
 
-    def _fetch_soup(self, method, url, **kwargs):
+    def fetch_soup(self, method, url, **kwargs):
         """Fetch one HTML document from the board and parse it.
 
         Streamed and capped rather than read in one go: ``response.text`` pulls
@@ -261,10 +182,21 @@ class BoardClient:
             bytes(body), "html.parser", from_encoding=declared.group(1) if declared else None
         )
 
+    def list_page_url(self, page):
+        return f"{self.base_url}/bbs/board.php?bo_table={self.board_id}&page={page}"
+
+    def image_url(self, img_filename):
+        """The board's URL for one card image.
+
+        quote() keeps a hostile filename from injecting query/fragment parts
+        into the URL; parse_card_link has already rejected path separators.
+        """
+        return f"{self.base_url}/data/file/{self.board_id}/{quote(img_filename, safe='')}"
+
     def get_html(self, url):
         log.info("Fetching list page: %s", url)
-        self._polite_sleep(*LIST_PAGE_DELAY)
-        return self._fetch_soup("GET", url)
+        self.polite_sleep(*LIST_PAGE_DELAY)
+        return self.fetch_soup("GET", url)
 
     def get_card_details(self, wr_id):
         payload = {"bo_table": self.board_id, "wr_id": wr_id}
@@ -276,11 +208,11 @@ class BoardClient:
         }
 
         log.info("Fetching details for wr_id %s", wr_id)
-        return self._fetch_soup("POST", self.ajax_url, data=payload, headers=headers)
+        return self.fetch_soup("POST", self.ajax_url, data=payload, headers=headers)
 
-    # --- images -----------------------------------------------------------
+    # --- downloading ------------------------------------------------------
 
-    def _reserve_filename(self, filename):
+    def reserve_filename(self, filename):
         """Return an unused path for ``filename``, suffixing -01..-99 on clash."""
         filepath = self.downloads_dir / filename
         if not filepath.exists():
@@ -300,7 +232,7 @@ class BoardClient:
         if not self.may_fetch(img_url):
             return None
 
-        filepath = self._reserve_filename(filename)
+        filepath = self.reserve_filename(filename)
         if filepath is None:
             return None
 

@@ -2,7 +2,7 @@
 
 import pytest
 
-from main import parse_card_link, safe_stem
+from nivel.domain.nikke.value_object.card_naming import parse_card_link, safe_stem
 
 
 class TestSafeStem:

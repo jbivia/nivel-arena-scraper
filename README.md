@@ -16,12 +16,21 @@ A containerized Python scraper that collects high-resolution trading card images
 
 ## Project Structure
 
-Two entry points, and one compose file per deployment:
+Two entry points, layered code under `src/`, and one compose file per deployment:
 
 ```text
-main.py                   # Scraper (Requests + BeautifulSoup)
-convert_to_png.py         # Image processing (OpenCV) -- a separate invocation
-card_metadata.py          # Detail-response parser (no I/O)
+main.py                   # Entry point: scrape          -- delegates to src/
+convert_to_png.py         # Entry point: PNG conversion   -- delegates to src/
+src/nivel/
+  domain/nikke/           # Entities, value objects, repository contracts. No I/O.
+  application/nikke/      # Use cases: scrape, backfill, repair, SQLite import
+  infrastructure/
+    persistence/          # Connection handling, credential redaction
+    nikke/persistence/    # PostgreSQL repositories
+    nikke/http/           # Board client: robots, rate limiting, size caps
+    nikke/parsing/        # Detail-response parser (no I/O)
+    nikke/image/          # JPG -> transparent PNG (OpenCV)
+  interface/cli/          # Argument parsing and composition
 RULES.md                  # Card layout and metadata field reference
 compose.yaml              # Development stack (Podman), satellite of the tracker
 compose.nas.yaml          # Standalone deployment: scraper + its own PostgreSQL
@@ -32,6 +41,11 @@ requirements*.lock        # Resolved + hash-pinned; what actually installs
 downloads/                # Raw JPG downloads (host-mounted)
 processed/                # Transparent PNGs (host-mounted)
 ```
+
+The package is never installed: `src` is named explicitly by `pythonpath` in
+`pyproject.toml` for pytest, by `ENV PYTHONPATH` in the `Containerfile`, and by the
+host-side `make` recipes. Running an entry point by path only ever puts the repository
+root on `sys.path`, so a direct `python main.py` from a shell needs `PYTHONPATH=src`.
 
 ## Prerequisites
 
@@ -164,7 +178,8 @@ make backfill-metadata-apply ARGS="--backfill-limit 5"   # or just the first few
 
 It is resumable — the connection is autocommit, so an interrupted run keeps what it stored and the
 next one continues where it stopped. Add `--force` to refresh rows that already have metadata, which
-is what to run after adding a missing value to `card_metadata.CARD_TYPE_EN` or `ELEMENT_EN`.
+is what to run after adding a missing value to `CARD_TYPE_EN` or `ELEMENT_EN` in
+`src/nivel/infrastructure/nikke/parsing/card_metadata.py`.
 
 ## Deploying to a Synology NAS
 

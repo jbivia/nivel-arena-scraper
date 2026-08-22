@@ -9,7 +9,7 @@ A mirror is a copy, and the failure mode of a copy is silent divergence. These
 tests are what makes it loud:
 
 * against this repository, always -- the mirror must satisfy the startup check
-  in `main._verify_cards_table`, so a column added to `CARD_COLUMNS` without a
+  in `PostgresCardRepository.verify_schema`, so a column added to `CARD_COLUMNS` without a
   matching column here fails the suite instead of a NAS scrape at 3am;
 * against the app, when it is checked out alongside -- the mirror must match
   `server/db/schema.ts` exactly, in both directions.
@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pytest
 
-import main
+from nivel.infrastructure.nikke.persistence.postgres_card_repository import CARD_COLUMNS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CARDS_TABLE_SQL = REPO_ROOT / "db" / "init" / "01-cards.sql"
@@ -67,8 +67,16 @@ def tracker_schema_columns(schema_ts):
     """Column names drizzle declares for `cards` in the app's schema.ts."""
     source = schema_ts.read_text(encoding="utf-8")
     start = source.index("pgTable('cards'")
-    # Every table in that file closes on a `})` at column zero.
-    end = source.index("\n})", start)
+    # A table in that file closes at column zero, on `})` when the call is just
+    # the column object and on `])` when a second argument follows it -- the
+    # index list `cards` gained in the app's 0004_card_indexes migration. Stop
+    # at whichever comes first: run past it and the next table's columns are
+    # read as this one's.
+    end = min(
+        (offset for offset in (source.find("\n})", start), source.find("\n])", start)) if offset != -1),
+        default=-1,
+    )
+    assert end != -1, f"No column-zero `}})` or `])` closing pgTable('cards') in {schema_ts}"
     block = source[start:end]
 
     # `text('wr_id')`, `integer('cost')`, `serial('id')`,
@@ -79,11 +87,11 @@ def tracker_schema_columns(schema_ts):
 def test_mirror_covers_every_column_the_scraper_writes():
     """The startup check must pass against a database built from the mirror.
 
-    `main._verify_cards_table` refuses to run when any of `CARD_COLUMNS` is
+    `PostgresCardRepository.verify_schema` refuses to run when any of `CARD_COLUMNS` is
     absent. A standalone NAS database is created from this file and nothing
     else, so anything missing here is a scrape that dies at startup.
     """
-    missing = sorted(main.CARD_COLUMNS - mirrored_columns())
+    missing = sorted(CARD_COLUMNS - mirrored_columns())
     assert not missing, f"db/init/01-cards.sql is missing {', '.join(missing)}"
 
 
@@ -120,7 +128,7 @@ def test_mirror_matches_the_app_schema():
         f"  only in the mirror: {sorted(mirrored - declared) or 'none'}\n"
         f"  only in schema.ts:  {sorted(declared - mirrored) or 'none'}\n"
         "The app owns this shape -- re-sync the mirror, and check whether "
-        "main.CARD_COLUMNS needs the new column too."
+        "CARD_COLUMNS needs the new column too."
     )
 
 
@@ -136,9 +144,9 @@ def test_scraper_writes_every_app_column_it_should():
     if not schema_ts.is_file():
         pytest.skip(f"{schema_ts} not found; set {TRACKER_REPO_ENV} to compare against the app")
 
-    unwritten = sorted(tracker_schema_columns(schema_ts) - main.CARD_COLUMNS - NOT_INSERTED_BY_SCRAPER)
+    unwritten = sorted(tracker_schema_columns(schema_ts) - CARD_COLUMNS - NOT_INSERTED_BY_SCRAPER)
     assert not unwritten, (
         f"The app's `cards` table has columns the scraper never writes: {', '.join(unwritten)}. "
-        "Either add them to main.CARD_COLUMNS and the catalogue upsert, or add them to "
+        "Either add them to CARD_COLUMNS and the catalogue upsert, or add them to "
         "NOT_INSERTED_BY_SCRAPER with a reason."
     )

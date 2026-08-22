@@ -1,9 +1,9 @@
 # NivelArena Card Scraper
 
 Containerized Python scraper for `nivelarena.co.kr` (GnuBoard5). Entry points are `main.py`
-(scrape) and `convert_to_png.py` (post-process); `card_metadata.py` parses the detail
-response. `make help` lists every target, `--help` every flag, `README.md` covers setup and
-deployment.
+(scrape) and `convert_to_png.py` (post-process); both are shims over `src/nivel/`, which is
+layered domain / application / infrastructure / interface. `make help` lists every target,
+`--help` every flag, `README.md` covers setup and deployment.
 
 ## Architecture
 
@@ -17,9 +17,16 @@ deployment.
 
 ## Things the code will not tell you
 
-- **`board.py` and `catalogue.py` are not wired up.** Nothing imports them and the
-  Containerfile does not copy them into the image; the live logic is in `main.py`, which
-  carries its own `CARD_COLUMNS` and `_verify_cards_table`. Change `main.py`.
+- **The `nivel` package is never installed.** `src` is on the path because three places
+  name it: `pythonpath` in `pyproject.toml`, `ENV PYTHONPATH` in the `Containerfile`, and
+  `LOAD_ENV_HOST` in the `Makefile`. A bare `python main.py` in a shell needs `PYTHONPATH=src`.
+- **The composition root exposes its collaborators, it does not wrap them.**
+  `NivelArenaScraper` hands out `.scrape`, `.backfill`, `.repair`, `.sqlite_import`, `.cards`,
+  `.history` and `.board`. Adding a forwarding method to it puts the signature in two places;
+  call the collaborator instead.
+- **`png_converter.convert_one` must stay importable.** Python 3.14 starts processes with
+  `forkserver` on Linux, so the pool's child re-imports the submitted function by name. It
+  lives in a normal module for that reason, not in the entry point.
 - **`convert_to_png.py` masks geometrically, not by colour.** It projects a background mask
   onto each axis to find the card rectangles, then cuts an antialiased rounded rectangle. A
   colour flood fill was tried first and escaped through light artwork and through the gutter

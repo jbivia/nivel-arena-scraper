@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 from bs4 import BeautifulSoup
 
-import card_metadata
+from nivel.infrastructure.nikke.parsing import card_metadata
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
