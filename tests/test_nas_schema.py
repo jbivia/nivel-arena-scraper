@@ -67,8 +67,16 @@ def tracker_schema_columns(schema_ts):
     """Column names drizzle declares for `cards` in the app's schema.ts."""
     source = schema_ts.read_text(encoding="utf-8")
     start = source.index("pgTable('cards'")
-    # Every table in that file closes on a `})` at column zero.
-    end = source.index("\n})", start)
+    # A table in that file closes at column zero, on `})` when the call is just
+    # the column object and on `])` when a second argument follows it -- the
+    # index list `cards` gained in the app's 0004_card_indexes migration. Stop
+    # at whichever comes first: run past it and the next table's columns are
+    # read as this one's.
+    end = min(
+        (offset for offset in (source.find("\n})", start), source.find("\n])", start)) if offset != -1),
+        default=-1,
+    )
+    assert end != -1, f"No column-zero `}})` or `])` closing pgTable('cards') in {schema_ts}"
     block = source[start:end]
 
     # `text('wr_id')`, `integer('cost')`, `serial('id')`,
