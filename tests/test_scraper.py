@@ -6,13 +6,14 @@ import sqlite3
 import pytest
 import requests
 
-import main
-from main import DatabaseNotConfigured, NivelArenaScraper
 from nivel.application.nikke.failure_policy import MAX_CONSECUTIVE_PAGE_FAILURES
 from nivel.domain.nikke.entity.card import Card
+from nivel.domain.nikke.exception.catalogue import DatabaseNotConfigured
 from nivel.infrastructure.nikke.http import board_client
 from nivel.infrastructure.nikke.http.board_client import MAX_IMAGE_BYTES
 from nivel.infrastructure.persistence.connection import DATABASE_URL_ENV, redact_conninfo
+from nivel.interface.cli import nikke as nikke_cli
+from nivel.interface.cli.nikke import NivelArenaScraper
 
 JPEG_BODY = b"\xff\xd8\xff\xe0" + b"\x00" * 512
 
@@ -221,7 +222,7 @@ class TestCatalogueTableCheck:
 
     def test_missing_table_is_a_clear_error(self, tmp_path, monkeypatch, database_url_without_cards):
         monkeypatch.setattr(board_client.time, "sleep", lambda _: None)
-        with pytest.raises(main.CatalogueTableMissing, match="db-migrate"):
+        with pytest.raises(nikke_cli.CatalogueTableMissing, match="db-migrate"):
             NivelArenaScraper(
                 "http://example.test",
                 "cardlists",
@@ -237,7 +238,7 @@ class TestCatalogueTableCheck:
             conn.execute("ALTER TABLE cards DROP COLUMN keywords, DROP COLUMN ip")
 
         monkeypatch.setattr(board_client.time, "sleep", lambda _: None)
-        with pytest.raises(main.CatalogueTableMissing, match="ip, keywords"):
+        with pytest.raises(nikke_cli.CatalogueTableMissing, match="ip, keywords"):
             NivelArenaScraper(
                 "http://example.test",
                 "cardlists",
@@ -540,11 +541,11 @@ class TestRobots:
 class TestEnvironmentSettings:
     def test_malformed_integer_falls_back_to_the_default(self, monkeypatch):
         monkeypatch.setenv("SCRAPER_MAX_PAGES", "not-a-number")
-        assert main.build_arg_parser().parse_args([]).max_pages is None
+        assert nikke_cli.build_arg_parser().parse_args([]).max_pages is None
 
     def test_valid_integer_is_used(self, monkeypatch):
         monkeypatch.setenv("SCRAPER_MAX_PAGES", "7")
-        assert main.build_arg_parser().parse_args([]).max_pages == 7
+        assert nikke_cli.build_arg_parser().parse_args([]).max_pages == 7
 
 
 class TestRepairFilenames:

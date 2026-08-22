@@ -5,8 +5,8 @@ import pytest
 
 cv2 = pytest.importorskip("cv2", reason="opencv-python-headless is not installed")
 
-import convert_to_png  # noqa: E402
-from convert_to_png import (  # noqa: E402
+from nivel.infrastructure.nikke.image import png_converter  # noqa: E402
+from nivel.infrastructure.nikke.image.png_converter import (  # noqa: E402
     collect_inputs,
     convert_card,
     corner_radius,
@@ -210,7 +210,7 @@ class TestProcessImage:
         assert process_image(src, processed) == (False, 0.0)
 
     def test_too_many_rectangles_is_refused(self, dirs, monkeypatch):
-        monkeypatch.setattr(convert_to_png, "MAX_CARDS", 1)
+        monkeypatch.setattr(png_converter, "MAX_CARDS", 1)
         downloads, processed = dirs
         src = write_stacked_pair(downloads / "pair.jpg")
 
@@ -274,7 +274,7 @@ class TestCollectInputs:
 
     def test_skips_oversized_input(self, dirs, monkeypatch):
         downloads, processed = dirs
-        monkeypatch.setattr(convert_to_png, "MAX_INPUT_BYTES", 10)
+        monkeypatch.setattr(png_converter, "MAX_INPUT_BYTES", 10)
         (downloads / "huge.jpg").write_bytes(b"\xff\xd8\xff" + b"\x00" * 100)
 
         assert collect_inputs(downloads, processed) == []
