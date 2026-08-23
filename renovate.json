@@ -18,7 +18,8 @@
     "description": [
       "Un correctif de faille ne doit pas attendre lundi matin : schedule vide",
       "le sort de la fenetre hebdomadaire, minimumReleaseAge null annule le",
-      "delai de maturation pose plus bas."
+      "delai de maturation pose plus bas, et les deux limites a 0 (= aucune",
+      "limite) les sortent du quota de PR ouvertes."
     ],
     "enabled": true,
     "labels": [
@@ -26,7 +27,9 @@
       "security"
     ],
     "schedule": [],
-    "minimumReleaseAge": null
+    "minimumReleaseAge": null,
+    "prConcurrentLimit": 0,
+    "prHourlyLimit": 0
   },
   "osvVulnerabilityAlerts": true,
   "description": [
