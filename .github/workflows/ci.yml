@@ -25,10 +25,14 @@ jobs:
         python-version: ["3.12", "3.13", "3.14"]
 
     # The scraper's SQL is PostgreSQL-specific, so the database tests run
-    # against a real server rather than a stand-in.
+    # against a real server rather than a stand-in. The patch version is
+    # pinned like the Containerfile's base image: `18-alpine` silently
+    # absorbs every patch release -- it has already carried this workflow
+    # from 18.0 to 18.6 -- and leaves Renovate nothing to raise a pull
+    # request about.
     services:
       postgres:
-        image: postgres:18-alpine
+        image: postgres:18.6-alpine
         env:
           POSTGRES_PASSWORD: postgres
         ports:
