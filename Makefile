@@ -24,9 +24,16 @@ LOAD_ENV_HOST = $(LOAD_ENV) export SCRAPER_DATABASE_URL="$${SCRAPER_DATABASE_URL
 # chicken-and-egg case -- `make venv` installs from a lock -- so the lock
 # recipes create the venv themselves and pip-install uv alone into it. A fresh
 # clone and Renovate's postUpgradeTasks both start out with no venv at all.
+#
+# The test is on uv's version, not on its presence: a venv predating a uv bump
+# would recompile with the old uv while CI, which installs uv from the lock,
+# uses the new one. That drift only shows up as a red `dependencies` job that
+# the machine which produced the lock cannot reproduce.
 UV = $(VENV)/bin/uv
-ENSURE_UV = test -x $(UV) || { test -x $(VENV)/bin/pip || $(PYTHON) -m venv $(VENV) && \
-            $(VENV)/bin/pip install -q "uv==$$(sed -n 's/^uv==//p' requirements-dev.txt)"; }
+UV_VERSION = $(shell sed -n 's/^uv==//p' requirements-dev.txt)
+ENSURE_UV = test "$$($(UV) --version 2>/dev/null | awk '{print $$2}')" = "$(UV_VERSION)" || { \
+            test -x $(VENV)/bin/pip || $(PYTHON) -m venv $(VENV) && \
+            $(VENV)/bin/pip install -q "uv==$(UV_VERSION)"; }
 UV_COMPILE = $(UV) pip compile --universal --generate-hashes --no-annotate \
              --python-version 3.12 --custom-compile-command "make lock"
 
