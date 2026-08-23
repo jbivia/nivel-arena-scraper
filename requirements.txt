@@ -10,7 +10,7 @@ beautifulsoup4==4.15.0
 opencv-python-headless==5.0.0.93
 # 2.5 dropped Python 3.11; pyproject.toml's floor is 3.12 for exactly that
 # reason, so this can stay on the newest series.
-numpy==2.5.1
+numpy==2.5.2
 # [binary] ships libpq in the wheel, so the image needs no postgresql-client
 # package and the read-only container has no system library to keep in sync.
 psycopg[binary]==3.3.4
