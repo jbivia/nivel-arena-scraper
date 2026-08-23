@@ -39,6 +39,25 @@
       ],
       "groupName": "dépendances Python",
       "groupSlug": "python-deps"
+    },
+    {
+      "description": [
+        "Deux actions, un seul fichier de workflow, et des majeures qui remplacent",
+        "les mineures sur les memes lignes : des PR separees proposeraient deux",
+        "valeurs incompatibles du meme SHA. Les majeures sont dans le groupe, la CI",
+        "servant de garde-fou.",
+        "matchDepTypes restreint le lot aux `uses:` : le manager github-actions",
+        "extrait aussi les images des blocs `services:`, sous le depType `service`,",
+        "et le postgres de la CI n'a rien a faire dans une PR d'actions."
+      ],
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchDepTypes": [
+        "action"
+      ],
+      "groupName": "actions GitHub",
+      "groupSlug": "github-actions"
     }
   ]
 }
