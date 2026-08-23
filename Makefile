@@ -21,9 +21,12 @@ LOAD_ENV_HOST = $(LOAD_ENV) export SCRAPER_DATABASE_URL="$${SCRAPER_DATABASE_URL
                 PYTHONPATH=src;
 
 # Compiling the locks needs uv, which lives in the venv. Bootstrapping it is a
-# chicken-and-egg case -- `make venv` installs from a lock -- so `make lock`
-# falls back to a hash-pinned pip install of uv alone.
+# chicken-and-egg case -- `make venv` installs from a lock -- so the lock
+# recipes create the venv themselves and pip-install uv alone into it. A fresh
+# clone and Renovate's postUpgradeTasks both start out with no venv at all.
 UV = $(VENV)/bin/uv
+ENSURE_UV = test -x $(UV) || { test -x $(VENV)/bin/pip || $(PYTHON) -m venv $(VENV) && \
+            $(VENV)/bin/pip install -q "uv==$$(sed -n 's/^uv==//p' requirements-dev.txt)"; }
 UV_COMPILE = $(UV) pip compile --universal --generate-hashes --no-annotate \
              --python-version 3.12 --custom-compile-command "make lock"
 
@@ -84,12 +87,12 @@ venv: ## Create a local virtualenv from the hash-pinned dev lock
 	$(VENV)/bin/pip install -q --require-hashes -r requirements-dev.lock
 
 lock: ## Recompile the hash-pinned lock files from requirements*.txt
-	@test -x $(UV) || $(VENV)/bin/pip install -q "uv==$$(sed -n 's/^uv==//p' requirements-dev.txt)"
+	@$(ENSURE_UV)
 	$(UV_COMPILE) requirements.txt -o requirements.lock
 	$(UV_COMPILE) requirements-dev.txt -o requirements-dev.lock
 
 lock-upgrade: ## Recompile the locks, taking the newest allowed transitive versions
-	@test -x $(UV) || $(VENV)/bin/pip install -q "uv==$$(sed -n 's/^uv==//p' requirements-dev.txt)"
+	@$(ENSURE_UV)
 	$(UV_COMPILE) --upgrade requirements.txt -o requirements.lock
 	$(UV_COMPILE) --upgrade requirements-dev.txt -o requirements-dev.lock
 
@@ -120,7 +123,7 @@ audit: ## Scan the runtime and dev dependency trees for known vulnerabilities
 	$(VENV)/bin/pip-audit --strict -r requirements-dev.lock
 
 verify-locks: ## Fail if a lock has drifted from its requirements file
-	@test -x $(UV) || $(VENV)/bin/pip install -q "uv==$$(sed -n 's/^uv==//p' requirements-dev.txt)"
+	@$(ENSURE_UV)
 	@tmp=$$(mktemp -d); cp requirements.lock requirements-dev.lock $$tmp/; \
 		$(UV_COMPILE) requirements.txt -o $$tmp/requirements.lock >/dev/null 2>&1; \
 		$(UV_COMPILE) requirements-dev.txt -o $$tmp/requirements-dev.lock >/dev/null 2>&1; \

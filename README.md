@@ -314,6 +314,13 @@ make lock-upgrade  # ...or take the newest allowed version of everything
 
 Commit the regenerated locks alongside the change; CI fails if they are out of step.
 
+Renovate does this for itself: `renovate.json` gives it a `postUpgradeTasks` hook that runs
+`make lock` on the branch, so its pull requests arrive with the locks already recompiled. That
+hook is only honoured because Renovate runs self-hosted here and the command is listed in that
+instance's global `allowedCommands` — a repository cannot grant itself the right to run commands.
+Python bumps are grouped into a single pull request for the same reason the locks matter: two
+concurrent branches would each recompile the same lock and conflict as soon as one merged.
+
 ## Maintenance
 
 ### Migrating from the SQLite database

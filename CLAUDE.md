@@ -57,7 +57,9 @@ layered domain / application / infrastructure / interface. `make help` lists eve
 - `requirements*.txt` hold the direct pins and are what you edit; `requirements*.lock` are
   the compiled, SHA-256-pinned trees the container, CI and `make venv` install from. Run
   `make lock` after any change — CI fails on lock drift, on an unhashed pin, and on a known
-  CVE in either tree.
+  CVE in either tree. Renovate runs `make lock` itself through `postUpgradeTasks`, which
+  only works because the instance is self-hosted and lists the command in its global
+  `allowedCommands`; the hosted app could not.
 - `pytest` treats warnings as errors: a deprecation out of a pinned dependency fails the
   build rather than scrolling past. Tests import `main` / `convert_to_png` directly; the
   OpenCV ones skip without `cv2`, the database ones without `SCRAPER_TEST_DATABASE_URL`.

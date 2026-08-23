@@ -1,3 +1,44 @@
 {
-  "$schema": "https://docs.renovatebot.com/renovate-schema.json"
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "description": [
+    "Les requirements*.txt sont les pins directs, les requirements*.lock l'arbre",
+    "compile et hashe dont le conteneur, la CI et make venv installent. Un bump",
+    "du seul .txt fait echouer le job `dependencies` sur la derive, et rend les",
+    "autres jobs verts pour rien: ils installent depuis le .lock, donc ils testent",
+    "encore l'ancienne version. Renovate doit donc recompiler lui-meme.",
+    "`make lock` reseme la compilation depuis le lock existant, exactement comme",
+    "l'etape de verification de la CI: seul le paquet bumpe bouge, les pins",
+    "transitifs restent en place. executionMode branch le lance une fois par",
+    "branche, apres tous les bumps du groupe, pas une fois par dependance.",
+    "Necessite `make lock` dans allowedCommands de la config globale de",
+    "l'instance self-hosted -- sans quoi la tache est ignoree en silence."
+  ],
+  "postUpgradeTasks": {
+    "commands": [
+      "make lock"
+    ],
+    "fileFilters": [
+      "requirements.lock",
+      "requirements-dev.lock"
+    ],
+    "executionMode": "branch"
+  },
+  "packageRules": [
+    {
+      "description": [
+        "Un seul lock pour deux fichiers de requirements: deux PR separees",
+        "recompilent chacune le meme .lock et entrent en conflit textuel des que",
+        "l'une des deux est mergee. Un groupe unique = une recompilation.",
+        "groupSlug garde le nom de branche en ASCII."
+      ],
+      "matchManagers": [
+        "pip_requirements"
+      ],
+      "groupName": "dépendances Python",
+      "groupSlug": "python-deps"
+    }
+  ]
 }
