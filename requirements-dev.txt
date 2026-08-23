@@ -1,7 +1,7 @@
 -r requirements.txt
 pytest==9.1.1
-ruff==0.16.0
+ruff==0.16.4
 pip-audit==2.10.1
 # Compiles the hash-pinned lock files (`make lock`). Pinned like everything
 # else: the tool that guarantees the other pins cannot itself float.
-uv==0.11.32
+uv==0.12.5
