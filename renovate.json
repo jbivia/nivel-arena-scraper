@@ -1,8 +1,37 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "config:recommended"
+    "config:recommended",
+    ":semanticCommits"
   ],
+  "timezone": "Europe/Paris",
+  "schedule": [
+    "before 7am on monday"
+  ],
+  "labels": [
+    "dependencies"
+  ],
+  "prConcurrentLimit": 5,
+  "prHourlyLimit": 2,
+  "configMigration": true,
+  "vulnerabilityAlerts": {
+    "description": [
+      "Un correctif de faille ne doit pas attendre lundi matin : schedule vide",
+      "le sort de la fenetre hebdomadaire, minimumReleaseAge null annule le",
+      "delai de maturation pose plus bas, et les deux limites a 0 (= aucune",
+      "limite) les sortent du quota de PR ouvertes."
+    ],
+    "enabled": true,
+    "labels": [
+      "dependencies",
+      "security"
+    ],
+    "schedule": [],
+    "minimumReleaseAge": null,
+    "prConcurrentLimit": 0,
+    "prHourlyLimit": 0
+  },
+  "osvVulnerabilityAlerts": true,
   "description": [
     "Les requirements*.txt sont les pins directs, les requirements*.lock l'arbre",
     "compile et hashe dont le conteneur, la CI et make venv installent. Un bump",
@@ -27,6 +56,20 @@
     "executionMode": "branch"
   },
   "packageRules": [
+    {
+      "description": [
+        "Laisser une version se stabiliser avant de la proposer : une release",
+        "publiee depuis moins de cinq jours peut encore etre depubliee ou",
+        "corrigee, et c'est aussi la fenetre de vie d'un paquet compromis.",
+        "internalChecksFilter strict empeche Renovate de la proposer quand meme."
+      ],
+      "matchManagers": [
+        "pip_requirements",
+        "github-actions"
+      ],
+      "minimumReleaseAge": "5 days",
+      "internalChecksFilter": "strict"
+    },
     {
       "description": [
         "Un seul lock pour deux fichiers de requirements: deux PR separees",
