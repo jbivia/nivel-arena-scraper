@@ -6,7 +6,7 @@
   ],
   "timezone": "Europe/Paris",
   "schedule": [
-    "before 7am on monday"
+    "on monday"
   ],
   "labels": [
     "dependencies"
@@ -16,6 +16,12 @@
   "configMigration": true,
   "vulnerabilityAlerts": {
     "description": [
+    "Fenetre volontairement large : elle couvre le lundi entier, pas seulement",
+    "l'avant 7h. L'instance self-hosted ne passe qu'une fois par jour, vers midi",
+    "heure de Paris ; une fenetre qui ne recouvre pas l'heure du passage ne se",
+    "declenche jamais et tout reste en 'Awaiting Schedule' au dependency dashboard,",
+    "sans la moindre erreur nulle part.",
+    "",
       "Un correctif de faille ne doit pas attendre lundi matin : schedule vide",
       "le sort de la fenetre hebdomadaire, minimumReleaseAge null annule le",
       "delai de maturation pose plus bas, et les deux limites a 0 (= aucune",
