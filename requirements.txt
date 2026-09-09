@@ -13,4 +13,4 @@ opencv-python-headless==5.0.0.93
 numpy==2.5.2
 # [binary] ships libpq in the wheel, so the image needs no postgresql-client
 # package and the read-only container has no system library to keep in sync.
-psycopg[binary]==3.3.4
+psycopg[binary]==3.3.5
