@@ -2,6 +2,8 @@
 pytest==9.1.1
 ruff==0.16.6
 pip-audit==2.10.1
+# Security floor for CVE-2026-112940, CVE-2026-112913 and CVE-2026-112907.
+filelock==4.2.1
 # Compiles the hash-pinned lock files (`make lock`). Pinned like everything
 # else: the tool that guarantees the other pins cannot itself float.
 uv==0.13.4
