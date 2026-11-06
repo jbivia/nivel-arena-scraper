@@ -1,6 +1,6 @@
 # Debian slim keeps OpenCV's shared-library dependencies simple.
 # Pin the patch version so rebuilds are reproducible; bump deliberately.
-FROM python:3.14.7-slim
+FROM python:3.15.2-slim
 
 # Fail fast, log immediately, and keep no bytecode cache in the image.
 ENV PYTHONUNBUFFERED=1 \
