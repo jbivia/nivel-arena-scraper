@@ -294,10 +294,10 @@ make check        # lint + test + verify-locks + audit
 
 The database-backed tests need a real server — the scraper's SQL is PostgreSQL-specific, so a stand-in would only test the stand-in. Point `SCRAPER_TEST_DATABASE_URL` at one (`make test-db-up` prints the URL) or those tests skip. Each test runs in its own throwaway schema, so a run leaves nothing behind.
 
-CI runs the same checks on Python 3.12–3.14 against a PostgreSQL service container, plus the dependency gate below and a container build, on every push and pull request, and weekly so newly-disclosed CVEs surface without a push.
+CI runs the same checks on Python 3.12–3.15 against a PostgreSQL service container, plus the dependency gate below and a container build, on every push and pull request, and weekly so newly-disclosed CVEs surface without a push.
 
 The floor is **Python 3.12** — the lowest version on which every dependency can be held at its newest
-release (numpy 2.5 dropped 3.11). The container image runs 3.14. `pytest` treats warnings as errors,
+release (numpy 2.5 dropped 3.11). The container image runs 3.15. `pytest` treats warnings as errors,
 so a deprecation out of a pinned dependency fails the build rather than scrolling past.
 
 ### Changing a dependency
