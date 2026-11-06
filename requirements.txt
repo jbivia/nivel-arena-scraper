@@ -4,7 +4,7 @@
 # the install instead of running.
 requests==2.34.2
 # Security floor: 2026.10.19 fixes PYSEC-2026-4320 in the requests trust store.
-certifi==2026.10.19
+certifi==2026.10.23
 # Imported directly by main.py for the retry policy, so pinned explicitly
 # rather than left to float as a transitive dependency of requests.
 urllib3==2.8.0
